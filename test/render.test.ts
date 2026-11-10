@@ -15,6 +15,17 @@ test("Claude-compatible token and duration formatting", () => {
   assert.equal(formatDuration(23400), "23s");
   assert.equal(formatDuration(119600), "2m 0s");
 });
+test("custom names label transcript rows; mixed names list each agent", () => {
+  const [single] = demoRuns()[1].map(run => { run.task.name = "researcher"; return run; });
+  assert.equal(renderRuns([single], plain, { expanded: false, hint: "" }).render(120)[0], "● researcher(Find authentication flow [demo])");
+  const [a, b] = demoRuns()[2]; a.task.name = "researcher"; b.task.name = "tester";
+  const lines = renderRuns([a, b], plain, { expanded: false, hint: "" }).render(120);
+  assert.equal(lines[0], "● Running 2 agents…");
+  assert.ok(lines[1].includes("researcher (Find authentication flow [demo])"));
+  assert.ok(lines[3].includes("tester (Inspect test coverage [demo])"));
+  b.task.name = "researcher";
+  assert.equal(renderRuns([a, b], plain, { expanded: false, hint: "" }).render(120)[0], "● Running 2 researcher agents…");
+});
 test("completed rows hide result until expanded", () => {
   assert.deepEqual(view(1), [
     "● Explore(Find authentication flow [demo]) (ctrl+o to expand)",

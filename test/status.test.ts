@@ -100,6 +100,24 @@ test("duplicate tool IDs stay independent and remaining names never renumber", (
   status.track(Symbol(), [run("Explore")]); status.publish(ctx);
   assert.deepEqual(titles(writes.at(-1)?.[1]), ["○ main", "○ Explore  task"]);
 });
+test("custom names replace role labels, number duplicates and fall back when blank", () => {
+  const { ctx, writes } = harness(); const status = new AgentStatus();
+  const r1 = run("Explore", "running", {}), r2 = run("general-purpose"), r3 = run("Plan"), blank = run("Explore");
+  r1.task.name = "researcher"; r2.task.name = "researcher"; r3.task.name = "reviewer"; blank.task.name = "  \n ";
+  status.track("call", [r1, r2, r3, blank]); status.publish(ctx);
+  assert.deepEqual(titles(writes.at(-1)?.[1]), ["○ main", "○ researcher  task", "○ researcher-2  task", "○ reviewer  task", "○ Explore  task"]);
+  assert.equal(status.name(r2), "researcher-2");
+  r1.status = "completed"; status.publish(ctx);
+  assert.equal(titles(writes.at(-1)?.[1])?.[1], "○ researcher-2  task"); // no renumbering
+});
+test("custom names are single-line and bounded", () => {
+  const child = run("Explore"); child.task.name = "a\nb\tc\x1b[31m" + "長".repeat(40);
+  const first = renderAgentStatus([child], plain)!.split("\n")[1].split("\t")[0];
+  assert.ok(!/[\x00-\x1f]/.test(first));
+  const name = first.slice(2, first.indexOf("  task"));
+  assert.equal([...name].length, 24);
+  assert.ok(name.startsWith("a b c [31m"));
+});
 test("identical states are cached and theme changes refresh styles", () => {
   const { ctx, writes, changeTheme } = harness(); const status = new AgentStatus(); const child = run("Explore", "pending");
   status.track("call", [child]); status.publish(ctx); assert.equal(writes.length, 0);

@@ -1,6 +1,8 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
-import { active, failed, type Run } from "./state.ts";
+import { active, customName, failed, type Run } from "./state.ts";
+
+const typeName = (run: Run) => customName(run.task) ?? run.task.subagent_type ?? "general-purpose";
 
 export type Palette = Pick<Theme, "fg" | "bold">;
 export interface ViewOptions {
@@ -53,19 +55,19 @@ export function renderRuns(runs: Run[], theme: Palette, options: ViewOptions): C
       const hint = options.hint ? dim(` (${options.hint})`) : "";
       if (runs.length > 1) {
         const running = runs.some(active);
-        const sameType = runs.every(r => (r.task.subagent_type ?? "general-purpose") === (runs[0].task.subagent_type ?? "general-purpose"));
-        const type = sameType ? `${runs[0].task.subagent_type ?? "general-purpose"} agents` : "agents";
+        const sameType = runs.every(r => typeName(r) === typeName(runs[0]));
+        const type = sameType ? `${typeName(runs[0])} agents` : "agents";
         lines.push(`${theme.fg(runs.some(failed) ? "error" : running ? "warning" : "success", "●")} ${running ? "Running " : ""}${theme.bold(String(runs.length))} ${type}${running ? "…" : " finished"}${hint}`);
         runs.forEach((run, i) => {
           const last = i === runs.length - 1;
-          const title = sameType ? theme.bold(run.task.description) : `${theme.bold(run.task.subagent_type ?? "general-purpose")} (${run.task.description})`;
+          const title = sameType ? theme.bold(run.task.description) : `${theme.bold(typeName(run))} (${run.task.description})`;
           body(`   ${last ? "└─" : "├─"} `, `${title} · ${stats(run)}`);
           body(`   ${last ? " " : "│"}  `, dim(summary(run)));
           if (options.expanded) details(run, `   ${last ? " " : "│"}  `);
         });
       } else if (runs[0]) {
         const run = runs[0];
-        const type = run.task.subagent_type === "general-purpose" || !run.task.subagent_type ? "Task" : run.task.subagent_type;
+        const type = customName(run.task) ?? (run.task.subagent_type === "general-purpose" || !run.task.subagent_type ? "Task" : run.task.subagent_type);
         body("", `${theme.fg(failed(run) ? "error" : active(run) ? "warning" : "success", "●")} ${theme.bold(type)}(${run.task.description})${hint}`);
         if (options.expanded) details(run, "     ");
         if (active(run) && !options.expanded) {

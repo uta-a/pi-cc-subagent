@@ -54,6 +54,15 @@ test("extension wiring keeps concurrent executions with duplicate provider ids i
   h.pending[1].resolve(response()); await b;
   assert.equal(h.writes.at(-1), undefined);
 });
+test("name parameter reaches the footer for single and parallel calls", async () => {
+  const h = harness();
+  const single = h.execute("one", { ...task, name: "researcher" }, undefined, undefined, h.ctx);
+  const parallel = h.execute("two", { tasks: [{ ...task, name: "reviewer" }, task] } as unknown as Task, undefined, undefined, h.ctx);
+  assert.deepEqual(h.writes.at(-1)?.split("\n").map(row => row.split("\t")[0]), ["○ main", "○ researcher  Find code", "○ reviewer  Find code", "○ Explore  Find code"]);
+  for (const pending of h.pending) pending.resolve(response());
+  await Promise.all([single, parallel]);
+  assert.equal(h.writes.at(-1), undefined);
+});
 test("model failure and abort clear live badges through execute finally", async () => {
   for (const abort of [false, true]) {
     const h = harness(); const controller = new AbortController();

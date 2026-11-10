@@ -7,6 +7,8 @@ export interface Task {
   description: string;
   prompt: string;
   subagent_type?: "Explore" | "Plan" | "general-purpose";
+  /** Optional display name, e.g. "researcher"; does not change permissions or routing. */
+  name?: string;
   profile?: Profile | "auto";
   model?: string;
   effort?: Effort | "auto";
@@ -48,6 +50,12 @@ export function addUsage(target: Usage, usage: Usage): void {
 }
 export function createRun(task: Task): Run {
   return { task, status: "pending", startedAt: 0, durationMs: 0, toolUses: 0, tokens: 0, usage: emptyUsage(), activities: [], output: "" };
+}
+export const MAX_NAME_LENGTH = 24;
+/** Single-line, bounded display name; undefined when absent or blank. */
+export function customName(task: Task): string | undefined {
+  const clean = task.name?.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").replace(/\s+/g, " ").trim();
+  return clean ? [...clean].slice(0, MAX_NAME_LENGTH).join("") : undefined;
 }
 export function active(run: Run): boolean {
   return run.status === "running" || run.status === "pending";

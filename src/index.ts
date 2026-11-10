@@ -18,11 +18,13 @@ const taskProperties = {
   description: Type.String({ minLength: 1, maxLength: 120, description: "Short task description (3–5 words)" }),
   prompt: Type.String({ minLength: 1, maxLength: 50000, description: "Self-contained task; the agent does not see parent conversation history" }),
   subagent_type: Type.Optional(Type.Union([Type.Literal("Explore"), Type.Literal("Plan"), Type.Literal("general-purpose")], { description: "Explore and Plan are read-only; general-purpose can edit files and run bash" })),
+  name: Type.Optional(Type.String({ minLength: 1, maxLength: 64, description: "Optional short display name such as researcher or reviewer (shown up to 24 characters); defaults to the agent type" })),
 };
 const schema = Type.Object({
   description: Type.Optional(taskProperties.description),
   prompt: Type.Optional(taskProperties.prompt),
   subagent_type: taskProperties.subagent_type,
+  name: taskProperties.name,
   ...routingProperties,
   tasks: Type.Optional(Type.Array(Type.Object(taskProperties), { minItems: 1, maxItems: 8, description: "Independent tasks to execute in parallel (up to 4 concurrently)" })),
 });
@@ -69,18 +71,19 @@ export default function ccSubagent(pi: ExtensionAPI): void {
     promptSnippet: "Run isolated subagents with Claude Code-style progress display",
     promptGuidelines: [
       "Use cc_subagent only when the user has authorized delegation; complexity alone is not authorization.",
-      "Give cc_subagent a self-contained prompt and short description. Use tasks for independent parallel work. Never assign overlapping file edits to parallel agents.",
+      "Give cc_subagent a self-contained prompt and short description; optionally set a short name (e.g. researcher, reviewer) to label it in the agent list.",
+      "Use cc_subagent tasks for independent parallel work. Never assign overlapping file edits to parallel agents.",
       "Choose cc_subagent model/effort/profile for each task: quick/minimal for targeted exploration, balanced/low for normal edits, deep/medium for difficult design or high-risk work. Avoid extra reviewers or repeated scans for trivial tasks. Leave model auto unless a specific available model is justified.",
     ],
     parameters: schema,
     renderShell: "self",
     async execute(id, params, signal, onUpdate, ctx) {
       if (disposed) throw new Error("Subagent extension has shut down");
-      const hasSingle = params.description !== undefined || params.prompt !== undefined || params.subagent_type !== undefined || params.model !== undefined || params.effort !== undefined || params.profile !== undefined;
+      const hasSingle = params.description !== undefined || params.prompt !== undefined || params.subagent_type !== undefined || params.name !== undefined || params.model !== undefined || params.effort !== undefined || params.profile !== undefined;
       if ((params.tasks !== undefined && hasSingle) || (!params.tasks && (!params.description || !params.prompt))) {
         throw new Error("Provide description + prompt OR tasks, not both.");
       }
-      const tasks: Task[] = params.tasks ?? [{ description: params.description!, prompt: params.prompt!, subagent_type: params.subagent_type, model: params.model, effort: params.effort, profile: params.profile }];
+      const tasks: Task[] = params.tasks ?? [{ description: params.description!, prompt: params.prompt!, subagent_type: params.subagent_type, name: params.name, model: params.model, effort: params.effort, profile: params.profile }];
       if (tasks.some(t => !t.description.trim() || !t.prompt.trim())) throw new Error("Task descriptions and prompts must not be blank.");
       clearDemo(ctx);
       navigation.attach(ctx);
