@@ -40,7 +40,10 @@ function harness() {
     } },
   } as unknown as ExtensionToolContext & ExtensionCommandContext;
   extension(pi);
-  return { events, commands, ctx, writes, notices, pending, execute: (...args: Parameters<Execute>) => tool.execute(...args), busy: () => { idle = false; } };
+  // These tests cover the foreground path; background defaults are covered in background.test.ts.
+  const execute = (id: string, params: Task, ...rest: [AbortSignal | undefined, (() => void) | undefined, ExtensionToolContext]) =>
+    tool.execute(id, { run_in_background: false, ...params } as Task, ...rest);
+  return { events, commands, ctx, writes, notices, pending, execute, busy: () => { idle = false; } };
 }
 const task: Task = { description: "Find code", prompt: "Find code", subagent_type: "Explore" };
 const flush = () => new Promise<void>(r => setImmediate(r));

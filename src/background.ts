@@ -15,6 +15,8 @@ export class BackgroundAgents {
 
   get size(): number { return this.jobs.size; }
 
+  hasCapacity(count: number): boolean { return !this.closed && this.jobs.size + count <= MAX_BACKGROUND_AGENTS; }
+
   launch(tasks: Task[], ctx: ExtensionToolContext) {
     if (this.closed) throw new Error("Subagent extension has shut down");
     if (tasks.some(task => task.subagent_type !== "Explore" && task.subagent_type !== "Plan")) {

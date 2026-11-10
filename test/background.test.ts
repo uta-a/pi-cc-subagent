@@ -91,6 +91,48 @@ test("background returns before responses, freezes a launch receipt and sends on
   h.shutdown();
 });
 
+test("read-only calls run in the background by default", async () => {
+  const h = harness();
+  const single = await h.execute({ ...task });
+  assert.match(single.content[0].text, /^Launched background agents:/);
+  const parallel = await h.execute({ tasks: [task, { ...task, subagent_type: "Plan" }] });
+  assert.match(parallel.content[0].text, /^Launched background agents:/);
+  assert.equal(h.pending.length, 3);
+  for (const pending of h.pending) pending.resolve(response());
+  await flush();
+  assert.equal(h.sent.length, 2);
+  h.shutdown();
+});
+test("default waits in the foreground for writable tasks, explicit false, or full capacity", async () => {
+  for (const params of [
+    { ...task, subagent_type: "general-purpose" as const },
+    { ...task, subagent_type: undefined },
+    { tasks: [task, { ...task, subagent_type: "general-purpose" as const }] },
+    { ...task, run_in_background: false },
+  ]) {
+    const h = harness();
+    let settled = false;
+    const call = h.execute(params).then(result => { settled = true; return result; });
+    await flush();
+    assert.equal(settled, false, JSON.stringify(params)); // waits for children
+    for (const pending of h.pending) pending.resolve(response("answer"));
+    const result = await call;
+    assert.match(result.content[0].text, /\[completed\]\nanswer/);
+    assert.equal(h.sent.length, 0);
+    h.shutdown();
+  }
+  const h = harness();
+  await h.execute({ tasks: Array.from({ length: MAX_BACKGROUND_AGENTS }, () => task) });
+  let settled = false;
+  const overflow = h.execute({ ...task }).then(result => { settled = true; return result; });
+  await flush();
+  assert.equal(settled, false); // capacity full: implicit default falls back to waiting instead of failing
+  for (const pending of h.pending) pending.resolve(response("answer"));
+  assert.match((await overflow).content[0].text, /\[completed\]/);
+  await flush();
+  assert.equal(h.sent.length, 1);
+  h.shutdown();
+});
 test("background rejects the whole call before launch if any task is writable or unspecified", async () => {
   const h = harness();
   for (const subagent_type of ["general-purpose", undefined] as const) {

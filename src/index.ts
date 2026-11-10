@@ -22,7 +22,7 @@ const taskProperties = {
   name: Type.Optional(Type.String({ minLength: 1, maxLength: 64, description: "Optional short display name such as researcher or reviewer (shown up to 24 characters); defaults to the agent type" })),
 };
 const schema = Type.Object({
-  run_in_background: Type.Optional(Type.Boolean({ default: false, description: "Return immediately and deliver all results later in one message. Applies to the whole call (single task or tasks); every task must explicitly be Explore or Plan. At most 4 background agents across calls; reject the whole call if capacity is insufficient. Background usage is not added to parent session totals." })),
+  run_in_background: Type.Optional(Type.Boolean({ description: "Applies to the whole call. Omitted (default): calls whose tasks are all Explore/Plan run in the background (return immediately, results arrive later in one message); calls with any general-purpose task, or when the 4-agent background capacity is full, wait in the foreground. false: always wait for results. true: require background; every task must be Explore or Plan and capacity must be available, otherwise the call is rejected. Background usage is not added to parent session totals." })),
   description: Type.Optional(taskProperties.description),
   prompt: Type.Optional(taskProperties.prompt),
   subagent_type: taskProperties.subagent_type,
@@ -71,13 +71,13 @@ export default function ccSubagent(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "cc_subagent",
     label: "Agent",
-    description: "Delegate an explicitly authorized task to isolated Pi subagents. Supply description + prompt OR tasks (max 8, concurrency 4). Adapts model and reasoning effort per task; model, effort and profile can be overridden. Preserves parent system instructions and permission checks, with bounded tool calls/output/turns. Explore/Plan are read-only; general-purpose can edit and run commands. Only core tools are exposed; no recursive delegation. run_in_background applies to the whole call, returns immediately, and delivers results later in one message; requires explicit Explore/Plan for every task. At most 4 background agents across calls; insufficient capacity rejects the whole call. Background usage is not added to parent session totals. Output is capped at 48 KiB per child and 48 KiB total.",
+    description: "Delegate an explicitly authorized task to isolated Pi subagents. Supply description + prompt OR tasks (max 8, concurrency 4). Adapts model and reasoning effort per task; model, effort and profile can be overridden. Preserves parent system instructions and permission checks, with bounded tool calls/output/turns. Explore/Plan are read-only; general-purpose can edit and run commands. Only core tools are exposed; no recursive delegation. By default, calls made only of Explore/Plan tasks run in the background: the tool returns immediately and results are delivered later in one message (at most 4 background agents across calls; otherwise it waits). Calls with general-purpose tasks always wait. Set run_in_background false to wait for read-only results. Background usage is not added to parent session totals. Output is capped at 48 KiB per child and 48 KiB total.",
     promptSnippet: "Run isolated subagents with Claude Code-style progress display",
     promptGuidelines: [
       "Use cc_subagent only when the user has authorized delegation; complexity alone is not authorization.",
       "Give cc_subagent a self-contained prompt and short description; optionally set a short name (e.g. researcher, reviewer) to label it in the agent list.",
       "Use cc_subagent tasks for independent parallel work. Never assign overlapping file edits to parallel agents.",
-      "Set cc_subagent run_in_background only for explicitly read-only Explore/Plan tasks when you can continue other work; it applies to the whole call. Await the later completion message rather than relaunching the same work. Background agents survive parent cancellation; /cc-agents-stop stops them.",
+      "cc_subagent runs Explore/Plan-only calls in the background by default. Keep working on something else, then use the later cc-subagent-result message; do not relaunch the same work or poll. Set run_in_background false when you need the findings before your next step. Background agents survive parent cancellation; /cc-agents-stop stops them.",
       "Choose cc_subagent model/effort/profile for each task: quick/minimal for targeted exploration, balanced/low for normal edits, deep/medium for difficult design or high-risk work. Avoid extra reviewers or repeated scans for trivial tasks. Leave model auto unless a specific available model is justified.",
     ],
     parameters: schema,
@@ -92,7 +92,11 @@ export default function ccSubagent(pi: ExtensionAPI): void {
       if (tasks.some(t => !t.description.trim() || !t.prompt.trim())) throw new Error("Task descriptions and prompts must not be blank.");
       clearDemo(ctx);
       navigation.attach(ctx);
-      if (params.run_in_background) return background.launch(tasks, ctx);
+      const readOnly = tasks.every(t => t.subagent_type === "Explore" || t.subagent_type === "Plan");
+      // Explicit true keeps strict validation; the implicit default never fails the call, it just waits instead.
+      if (params.run_in_background === true || (params.run_in_background === undefined && readOnly && background.hasCapacity(tasks.length))) {
+        return background.launch(tasks, ctx);
+      }
       const runs = tasks.map(createRun);
       const key = Symbol(id);
       status.track(key, runs);
