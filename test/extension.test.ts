@@ -48,9 +48,9 @@ test("extension wiring keeps concurrent executions with duplicate provider ids i
   const h = harness();
   const a = h.execute("same-id", task, undefined, undefined, h.ctx);
   const b = h.execute("same-id", task, undefined, undefined, h.ctx);
-  assert.deepEqual(h.writes.at(-1)?.split("\n").map(row => row.split("\t")[0]), ["● main", "○ Explore  Find code", "○ Explore-2  Find code"]);
+  assert.deepEqual(h.writes.at(-1)?.split("\n").map(row => row.split("\t")[0]), ["○ main", "○ Explore  Find code", "○ Explore-2  Find code"]);
   h.pending[0].resolve(response()); await a;
-  assert.match(h.writes.at(-1)!, /^● main\n○ Explore-2  Find code\t/);
+  assert.match(h.writes.at(-1)!, /^○ main\n○ Explore-2  Find code\t/);
   h.pending[1].resolve(response()); await b;
   assert.equal(h.writes.at(-1), undefined);
 });
@@ -93,7 +93,7 @@ test("footer ticks do not emit duplicate full tool snapshots", async t => {
 test("demo expires, supports off, rejects busy mode and is cleared before real work", async t => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
   const h = harness(); const demo = h.commands.get("cc-subagent-status-demo")!;
-  await demo("", h.ctx); assert.match(h.writes.at(-1)!, /^● main\n○ Explore  ホームの git リポジトリ概要調査\t6s · ↓ 26\.4k tokens$/);
+  await demo("", h.ctx); assert.match(h.writes.at(-1)!, /^○ main\n○ Explore  ホームの git リポジトリ概要調査\t6s · ↓ 26\.4k tokens$/);
   t.mock.timers.tick(10_000); assert.equal(h.writes.at(-1), undefined);
   await demo("", h.ctx); await demo("off", h.ctx); assert.equal(h.writes.at(-1), undefined);
   await demo("", h.ctx);
@@ -101,7 +101,7 @@ test("demo expires, supports off, rejects busy mode and is cleared before real w
   h.events.get("before_agent_start")!({}, h.ctx); assert.equal(h.writes.at(-1), undefined);
   await demo("", h.ctx);
   const execution = h.execute("id", task, undefined, undefined, h.ctx);
-  assert.match(h.writes.at(-1)!, /^● main\n○ Explore  Find code\t/);
+  assert.match(h.writes.at(-1)!, /^○ main\n○ Explore  Find code\t/);
   await demo("", h.ctx); assert.match(h.notices.at(-1)!, /unavailable/);
   h.pending[0].resolve(response()); await execution;
   h.busy(); await demo("", h.ctx); assert.match(h.notices.at(-1)!, /unavailable/);

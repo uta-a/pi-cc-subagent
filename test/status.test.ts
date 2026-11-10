@@ -63,18 +63,22 @@ test("running and name expose tracked references and stable names", () => {
   const capped = new AgentStatus(); capped.track("many", Array.from({ length: 12 }, () => run()));
   assert.equal(capped.running().length, 8);
 });
-test("move cycles between main and children in both directions", () => {
+test("arrows follow chat → main → children and clamp at both ends", () => {
   const { ctx } = harness(); const status = new AgentStatus(); const a = run("Explore"), b = run("Plan");
   status.track("call", [a, b]);
-  status.move(1, ctx); assert.equal(status.selectedRun, a); assert.ok(status.selecting);
+  status.move(-1, ctx); assert.equal(status.selecting, false); // chat is the top boundary
+  status.move(1, ctx); assert.equal(status.selectedRun, null); assert.ok(status.selecting); // main
+  status.move(1, ctx); assert.equal(status.selectedRun, a);
   status.move(1, ctx); assert.equal(status.selectedRun, b);
-  status.move(1, ctx); assert.equal(status.selectedRun, null);
-  status.move(-1, ctx); assert.equal(status.selectedRun, b);
-  status.deselect(ctx); assert.equal(status.selectedRun, null); assert.equal(status.selecting, false);
+  status.move(1, ctx); status.move(1, ctx); assert.equal(status.selectedRun, b); // no bottom wrap
+  status.move(-1, ctx); assert.equal(status.selectedRun, a);
+  status.move(-1, ctx); assert.equal(status.selectedRun, null); assert.ok(status.selecting); // main
+  status.move(-1, ctx); assert.equal(status.selecting, false); // chat
+  status.move(-1, ctx); assert.equal(status.selecting, false); assert.equal(status.selectedRun, null);
 });
 test("selection is attached to the Run object when preceding children finish", () => {
   const { ctx, writes } = harness(); const status = new AgentStatus(); const a = run("Explore"), b = run("Explore"), c = run("Plan");
-  status.track("call", [a, b, c]); status.move(1, ctx); status.move(1, ctx);
+  status.track("call", [a, b, c]); status.move(1, ctx); status.move(1, ctx); status.move(1, ctx);
   a.status = "completed"; status.publish(ctx);
   assert.equal(status.selectedRun, b);
   assert.deepEqual(titles(writes.at(-1)?.[1]), ["○ main", "● Explore-2  task", "○ Plan  task"]);
@@ -82,7 +86,7 @@ test("selection is attached to the Run object when preceding children finish", (
 });
 test("finished or released selection returns to main; all finished resets selection mode", () => {
   const { ctx, writes } = harness(); const status = new AgentStatus(); const a = run("Explore");
-  status.track("call", [a]); status.move(1, ctx); status.release("call", ctx);
+  status.track("call", [a]); status.move(1, ctx); status.move(1, ctx); status.release("call", ctx);
   assert.equal(status.selectedRun, null); assert.equal(status.selecting, false);
   assert.deepEqual(writes.at(-1), [STATUS_KEY, undefined]);
 });
@@ -91,16 +95,16 @@ test("duplicate tool IDs stay independent and remaining names never renumber", (
   const keyA = Symbol("same"), keyB = Symbol("same");
   status.track(keyA, [a]); status.track(keyB, [b]); status.publish(ctx);
   status.release(keyA, ctx);
-  assert.deepEqual(titles(writes.at(-1)?.[1]), ["● main", "○ Explore-2  task"]);
+  assert.deepEqual(titles(writes.at(-1)?.[1]), ["○ main", "○ Explore-2  task"]);
   status.release(keyB, ctx); assert.equal(writes.at(-1)?.[1], undefined);
   status.track(Symbol(), [run("Explore")]); status.publish(ctx);
-  assert.deepEqual(titles(writes.at(-1)?.[1]), ["● main", "○ Explore  task"]);
+  assert.deepEqual(titles(writes.at(-1)?.[1]), ["○ main", "○ Explore  task"]);
 });
 test("identical states are cached and theme changes refresh styles", () => {
   const { ctx, writes, changeTheme } = harness(); const status = new AgentStatus(); const child = run("Explore", "pending");
   status.track("call", [child]); status.publish(ctx); assert.equal(writes.length, 0);
   child.status = "running"; status.publish(ctx); status.publish(ctx); assert.equal(writes.length, 1);
-  changeTheme(tagged); status.publish(ctx); assert.ok(writes.at(-1)?.[1]?.startsWith("<w:b>● main"));
+  changeTheme(tagged); status.publish(ctx); assert.ok(writes.at(-1)?.[1]?.startsWith("<g>○ main"));
 });
 test("shutdown clears only our key and ignores late callbacks", () => {
   const { ctx, writes } = harness(); const status = new AgentStatus(); status.track("old", [run()]); status.publish(ctx); status.shutdown(ctx);

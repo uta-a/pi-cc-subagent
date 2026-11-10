@@ -17,7 +17,7 @@ export function agentRole(run: Run): "explore" | "plan" | "worker" {
 }
 
 /** CC's footer shows live agents, not completed transcript rows. Dot labels are our adaptation. */
-export function renderAgentStatus(runs: readonly Run[], theme: StatusPalette, labels?: WeakMap<Run, string>, now = Date.now(), selected: Run | null = null): string | undefined {
+export function renderAgentStatus(runs: readonly Run[], theme: StatusPalette, labels?: WeakMap<Run, string>, now = Date.now(), selected: Run | null = null, selecting = true): string | undefined {
   const counts = new Map<string, number>();
   const named = runs.map(run => {
     const role = agentRole(run);
@@ -28,7 +28,8 @@ export function renderAgentStatus(runs: readonly Run[], theme: StatusPalette, la
   const running = named.filter(({ run }) => run.status === "running");
   if (!running.length) return undefined;
   const gray = (text: string) => theme.style(text, { fg: GRAY });
-  const rows = [theme.style(`${selected ? "○" : "●"} main`, { fg: selected ? GRAY : WHITE, bold: !selected })];
+  const mainSelected = selecting && !selected;
+  const rows = [theme.style(`${mainSelected ? "●" : "○"} main`, { fg: mainSelected ? WHITE : GRAY, bold: mainSelected })];
   for (const { run, label } of running.slice(0, MAX_BADGES)) {
     const name = label.replace(/^explore/, "Explore").replace(/^plan/, "Plan");
     const description = run.task.description.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").trim();
@@ -63,9 +64,11 @@ export class AgentStatus {
 
   move(direction: number, ctx: ExtensionContext): void {
     const rows: (Run | null)[] = [null, ...this.running()];
-    const index = Math.max(0, rows.indexOf(this.selectedRun));
-    this.selectedRun = rows[(index + direction + rows.length) % rows.length];
-    this.selecting = true;
+    // -1 is the chat editor; 0 is main; 1..N are live child rows.
+    const index = this.selecting ? Math.max(0, rows.indexOf(this.selectedRun)) : -1;
+    const next = Math.max(-1, Math.min(rows.length - 1, index + direction));
+    this.selectedRun = next > 0 ? rows[next] : null;
+    this.selecting = next >= 0;
     this.publish(ctx);
   }
 
@@ -93,7 +96,7 @@ export class AgentStatus {
     const running = this.running();
     if (!running.length) { this.selectedRun = null; this.selecting = false; }
     else if (this.selectedRun && !running.includes(this.selectedRun)) this.selectedRun = null;
-    const text = renderAgentStatus([...this.groups.values()].flat(), ctx.ui.theme, this.labels, Date.now(), this.selectedRun);
+    const text = renderAgentStatus([...this.groups.values()].flat(), ctx.ui.theme, this.labels, Date.now(), this.selectedRun, this.selecting);
     if (text === this.last) return;
     this.last = text;
     ctx.ui.setStatus(STATUS_KEY, text);

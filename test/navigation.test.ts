@@ -39,7 +39,8 @@ function setup(runs = [child()], mode: ExtensionContext["mode"] = "tui") {
   const send = (key: string) => editor.handleInput(key);
   const press = (key: string) => state.component!.handleInput!(key);
   const text = () => state.component!.render(100).join("\n");
-  return { ctx, status, nav, state, send, press, text, original, editor };
+  const openFirstChild = () => { send(K.down); send(K.down); send(K.enter); };
+  return { ctx, status, nav, state, send, press, text, original, editor, openFirstChild };
 }
 const flush = () => new Promise<void>(resolve => setImmediate(resolve));
 
@@ -61,13 +62,17 @@ test("navigation wraps only the editor, never globally intercepting dialog keys"
   }
   const h = setup(); h.nav.attach(h.ctx); assert.equal(h.state.attaches, 1); h.nav.shutdown();
 });
-test("unselected up keeps normal history; down enters agent selection and arrows cycle", () => {
+test("editor arrows traverse chat/main/sub1/sub2 without wrapping", () => {
   const a = child("a"), b = child("b"); const h = setup([a, b]); h.nav.attach(h.ctx);
   h.send(K.up); assert.deepEqual(h.state.passed, [K.up]); assert.equal(h.status.selecting, false);
+  h.send(K.down); assert.equal(h.status.selectedRun, null); assert.ok(h.status.selecting); // main
   h.send(K.down); assert.equal(h.status.selectedRun, a);
   h.send(K.down); assert.equal(h.status.selectedRun, b);
-  h.send(K.down); assert.equal(h.status.selectedRun, null);
-  h.send(K.up); assert.equal(h.status.selectedRun, b);
+  h.send(K.down); h.send(K.down); assert.equal(h.status.selectedRun, b); // bottom stays sub2
+  h.send(K.up); assert.equal(h.status.selectedRun, a);
+  h.send(K.up); assert.equal(h.status.selectedRun, null); assert.ok(h.status.selecting); // main
+  h.send(K.up); assert.equal(h.status.selecting, false); // chat
+  h.send(K.up); assert.equal(h.status.selecting, false); assert.equal(h.status.selectedRun, null);
   h.nav.shutdown();
 });
 test("nonempty prompts preserve arrows and submission; text input deselects", () => {
@@ -85,22 +90,34 @@ test("empty Enter passes through until selection; Escape clears selection only",
 });
 test("switching back to main closes the preview without aborting the child", async () => {
   const a = child("auth"); a.currentActivity = "Read(auth.ts)";
-  const h = setup([a]); h.nav.attach(h.ctx); h.send(K.down); h.send(K.enter);
+  const h = setup([a]); h.nav.attach(h.ctx); h.openFirstChild();
   assert.match(h.text(), /Explore — live activity/); assert.match(h.text(), /Now: Read\(auth.ts\)/);
   h.press(K.up); await flush();
   assert.equal(h.state.component, undefined); assert.equal(a.status, "running");
-  assert.equal(h.status.selecting, false); assert.equal(h.status.selectedRun, null);
+  assert.equal(h.status.selecting, true); assert.equal(h.status.selectedRun, null);
+  h.send(K.up); assert.equal(h.status.selecting, false); // main → chat is a separate step
+  h.nav.shutdown();
+});
+test("preview arrows stop at the last child and return through sub1 and main", async () => {
+  const a = child("sub1"), b = child("sub2"); const h = setup([a, b]); h.nav.attach(h.ctx); h.openFirstChild();
+  h.press(K.down); assert.match(h.text(), /Task: sub2/);
+  h.press(K.down); h.press(K.down);
+  assert.equal(h.status.selectedRun, b); assert.match(h.text(), /Task: sub2/);
+  h.press(K.up); assert.match(h.text(), /Task: sub1/);
+  h.press(K.up); await flush();
+  assert.equal(h.state.component, undefined); assert.equal(h.status.selecting, true); assert.equal(h.status.selectedRun, null);
+  h.send(K.up); assert.equal(h.status.selecting, false);
   h.nav.shutdown();
 });
 test("Enter on main never opens a preview", async () => {
-  const h = setup(); h.nav.attach(h.ctx); h.send(K.down); h.send(K.up);
+  const h = setup(); h.nav.attach(h.ctx); h.send(K.down);
   assert.equal(h.status.selectedRun, null);
   h.send(K.enter); await flush();
-  assert.equal(h.state.component, undefined); assert.equal(h.status.selecting, false);
+  assert.equal(h.state.component, undefined); assert.equal(h.status.selecting, true);
   h.nav.shutdown();
 });
 test("live activity changes and final child output update the open panel", async () => {
-  const a = child(); const h = setup([a]); h.nav.attach(h.ctx); h.send(K.down); h.send(K.enter);
+  const a = child(); const h = setup([a]); h.nav.attach(h.ctx); h.openFirstChild();
   a.currentActivity = "Bash(npm test)"; a.liveText = "streaming now";
   assert.match(h.text(), /Bash\(npm test\)/); assert.match(h.text(), /streaming now/);
   a.status = "completed"; a.output = "final answer";
@@ -109,7 +126,7 @@ test("live activity changes and final child output update the open panel", async
 });
 test("scrolling and CJK narrow widths are bounded", async () => {
   const a = child("日本語の調査"); a.task.prompt = "日本語の長いプロンプト\n".repeat(50);
-  const h = setup([a]); h.nav.attach(h.ctx); h.send(K.down); h.send(K.enter);
+  const h = setup([a]); h.nav.attach(h.ctx); h.openFirstChild();
   for (const width of [1, 2, 4, 20, 80, 120]) {
     for (const line of h.state.component!.render(width)) assert.ok(visibleWidth(line) <= width);
   }
@@ -119,7 +136,7 @@ test("scrolling and CJK narrow widths are bounded", async () => {
 });
 test("timer and editor wrapper are disposed on shutdown; closing is idempotent", async t => {
   t.mock.timers.enable({ apis: ["setInterval"] });
-  const h = setup(); h.nav.attach(h.ctx); h.send(K.down); h.send(K.enter);
+  const h = setup(); h.nav.attach(h.ctx); h.openFirstChild();
   t.mock.timers.tick(999); assert.equal(h.state.renders, 0);
   t.mock.timers.tick(1); assert.ok(h.state.renders > 0);
   h.nav.shutdown(); h.nav.shutdown(); await flush();

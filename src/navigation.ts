@@ -78,10 +78,11 @@ export class AgentNavigation {
   async open(ctx: ExtensionContext): Promise<void> {
     if (ctx.mode !== "tui" || this.viewOpen || this.closed) return;
     const initial = this.status.selectedRun;
-    if (!initial) { this.status.deselect(ctx); return; }
+    if (!initial) return;
     let viewed: Run = initial;
     this.viewOpen = true;
     let scroll = 0;
+    let returnedToMain = false;
     try {
       await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
         let disposed = false;
@@ -110,7 +111,7 @@ export class AgentNavigation {
             if (matchesKey(data, "up") || matchesKey(data, "down")) {
               this.status.move(matchesKey(data, "up") ? -1 : 1, ctx);
               const next = this.status.selectedRun;
-              if (!next) { close(); return; }
+              if (!next) { returnedToMain = true; close(); return; }
               viewed = next;
               scroll = 0;
             } else if (matchesKey(data, "pageUp")) scroll = Math.max(0, scroll - 8);
@@ -123,7 +124,7 @@ export class AgentNavigation {
     } finally {
       this.viewOpen = false;
       this.closeView = undefined;
-      if (!this.closed) this.status.deselect(ctx);
+      if (!this.closed && !returnedToMain) this.status.deselect(ctx);
     }
   }
 

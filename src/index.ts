@@ -166,7 +166,8 @@ export default function ccSubagent(pi: ExtensionAPI): void {
       navigation.attach(ctx);
       if (!status.selectedRun) {
         if (!status.running().length) { ctx.ui.notify("No running subagents", "info"); return; }
-        status.move(1, ctx);
+        if (!status.selecting) status.move(1, ctx); // chat → main
+        status.move(1, ctx); // main → first child
       }
       await navigation.open(ctx);
     },
