@@ -14,6 +14,7 @@ export function agentDetailLines(run: Run): string[] {
   return [
     `Task: ${run.task.description}`,
     `Status: ${run.status}`,
+    `Usage: ${run.usage.totalTokens} cumulative tokens · $${run.usage.cost.total.toFixed(4)}`,
     ...(run.model ? [`Model: ${run.model} · effort: ${run.effort ?? "off"} · profile: ${run.profile ?? "balanced"}`] : []),
     `Now: ${run.currentActivity ?? run.activities.at(-1)?.text ?? "Waiting for model response…"}`,
     "", "Prompt:", run.task.prompt,

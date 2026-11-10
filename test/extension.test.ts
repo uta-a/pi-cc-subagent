@@ -19,6 +19,7 @@ function harness() {
     registerTool(definition: unknown) { tool = definition as typeof tool; },
     registerCommand(name: string, definition: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) { commands.set(name, definition.handler); },
     registerEntryRenderer() {},
+    registerMessageRenderer() {},
   } as unknown as ExtensionAPI;
   const writes: (string | undefined)[] = [], notices: string[] = [];
   const pending: { resolve: (message: AssistantMessage) => void; signal: AbortSignal }[] = [];

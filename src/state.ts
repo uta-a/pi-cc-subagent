@@ -37,6 +37,8 @@ export interface Run {
 }
 export interface Details {
   runs: Run[];
+  /** Frozen launch receipt; live state belongs to the status list and preview. */
+  background?: boolean;
 }
 export function emptyUsage(): Usage {
   return {

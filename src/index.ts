@@ -7,6 +7,7 @@ import { renderRuns } from "./render.ts";
 import { demoRuns } from "./preview.ts";
 import { AgentStatus } from "./status.ts";
 import { AgentNavigation } from "./navigation.ts";
+import { BackgroundAgents, RESULT_MESSAGE_TYPE } from "./background.ts";
 
 const routingProperties = {
   model: Type.Optional(Type.String({ description: "Available provider/model ID; auto (default) routes by task, inherit keeps the parent model" })),
@@ -21,6 +22,7 @@ const taskProperties = {
   name: Type.Optional(Type.String({ minLength: 1, maxLength: 64, description: "Optional short display name such as researcher or reviewer (shown up to 24 characters); defaults to the agent type" })),
 };
 const schema = Type.Object({
+  run_in_background: Type.Optional(Type.Boolean({ default: false, description: "Return immediately and deliver all results later in one message. Applies to the whole call (single task or tasks); every task must explicitly be Explore or Plan. At most 4 background agents across calls; reject the whole call if capacity is insufficient. Background usage is not added to parent session totals." })),
   description: Type.Optional(taskProperties.description),
   prompt: Type.Optional(taskProperties.prompt),
   subagent_type: taskProperties.subagent_type,
@@ -33,6 +35,7 @@ export default function ccSubagent(pi: ExtensionAPI): void {
   const controllers = new Set<AbortController>();
   const status = new AgentStatus();
   const navigation = new AgentNavigation(status);
+  const background = new BackgroundAgents(pi, status);
   pi.on("session_start", (_event, ctx) => {
     const timer = setTimeout(() => {
       timers.delete(timer);
@@ -51,6 +54,7 @@ export default function ccSubagent(pi: ExtensionAPI): void {
   };
   pi.on("session_shutdown", (_event, ctx) => {
     disposed = true;
+    background.shutdown();
     navigation.shutdown();
     if (demoTimer) clearTimeout(demoTimer);
     demoTimer = undefined;
@@ -67,12 +71,13 @@ export default function ccSubagent(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "cc_subagent",
     label: "Agent",
-    description: "Delegate an explicitly authorized task to isolated Pi subagents. Supply description + prompt OR tasks (max 8, concurrency 4). Adapts model and reasoning effort per task; model, effort and profile can be overridden. Preserves parent system instructions and permission checks, with bounded tool calls/output/turns. Explore/Plan are read-only; general-purpose can edit and run commands. Only core tools are exposed. No background execution or recursive delegation. Output is capped at 48 KiB per child and 48 KiB total.",
+    description: "Delegate an explicitly authorized task to isolated Pi subagents. Supply description + prompt OR tasks (max 8, concurrency 4). Adapts model and reasoning effort per task; model, effort and profile can be overridden. Preserves parent system instructions and permission checks, with bounded tool calls/output/turns. Explore/Plan are read-only; general-purpose can edit and run commands. Only core tools are exposed; no recursive delegation. run_in_background applies to the whole call, returns immediately, and delivers results later in one message; requires explicit Explore/Plan for every task. At most 4 background agents across calls; insufficient capacity rejects the whole call. Background usage is not added to parent session totals. Output is capped at 48 KiB per child and 48 KiB total.",
     promptSnippet: "Run isolated subagents with Claude Code-style progress display",
     promptGuidelines: [
       "Use cc_subagent only when the user has authorized delegation; complexity alone is not authorization.",
       "Give cc_subagent a self-contained prompt and short description; optionally set a short name (e.g. researcher, reviewer) to label it in the agent list.",
       "Use cc_subagent tasks for independent parallel work. Never assign overlapping file edits to parallel agents.",
+      "Set cc_subagent run_in_background only for explicitly read-only Explore/Plan tasks when you can continue other work; it applies to the whole call. Await the later completion message rather than relaunching the same work. Background agents survive parent cancellation; /cc-agents-stop stops them.",
       "Choose cc_subagent model/effort/profile for each task: quick/minimal for targeted exploration, balanced/low for normal edits, deep/medium for difficult design or high-risk work. Avoid extra reviewers or repeated scans for trivial tasks. Leave model auto unless a specific available model is justified.",
     ],
     parameters: schema,
@@ -87,6 +92,7 @@ export default function ccSubagent(pi: ExtensionAPI): void {
       if (tasks.some(t => !t.description.trim() || !t.prompt.trim())) throw new Error("Task descriptions and prompts must not be blank.");
       clearDemo(ctx);
       navigation.attach(ctx);
+      if (params.run_in_background) return background.launch(tasks, ctx);
       const runs = tasks.map(createRun);
       const key = Symbol(id);
       status.track(key, runs);
@@ -139,7 +145,7 @@ export default function ccSubagent(pi: ExtensionAPI): void {
     renderCall() { return new Container(); },
     renderResult(result, { expanded }, theme, context) {
       const details = result.details as Details | undefined;
-      if (!details?.runs?.length) {
+      if (details?.background || !details?.runs?.length) {
         return new Text(result.content.filter(p => p.type === "text").map(p => p.text).join("\n"), 0, 0);
       }
       return renderRuns(details.runs, theme, {
@@ -147,6 +153,21 @@ export default function ccSubagent(pi: ExtensionAPI): void {
         hint: context.keyHint("app.tools.expand", "to expand"),
         rows: process.stdout.rows,
       });
+    },
+  });
+  pi.registerMessageRenderer(RESULT_MESSAGE_TYPE, (message, options, theme) => {
+    const details = message.details as Details;
+    return renderRuns(details.runs, theme, {
+      expanded: options.expanded,
+      hint: options.keyHint("app.tools.expand", "to expand"),
+      rows: process.stdout.rows,
+    });
+  });
+  pi.registerCommand("cc-agents-stop", {
+    description: "Stop background agents: /cc-agents-stop [display-name] (no argument stops all)",
+    handler: async (args, ctx) => {
+      const count = background.stop(args.trim() || undefined);
+      ctx.ui.notify(count ? `Stopping ${count} background agent(s)` : "No matching background agents", "info");
     },
   });
   pi.registerCommand("cc-agent", {
@@ -181,7 +202,7 @@ export default function ccSubagent(pi: ExtensionAPI): void {
       if (ctx.mode !== "tui") { ctx.ui.notify("Demo requires interactive mode", "warning"); return; }
       if (args.trim() && args.trim() !== "off") { ctx.ui.notify("Usage: /cc-subagent-status-demo [off]", "info"); return; }
       if (args.trim() === "off") { clearDemo(ctx); return; }
-      if (!ctx.isIdle() || controllers.size) { ctx.ui.notify("Status demo is unavailable while agents are running", "warning"); return; }
+      if (!ctx.isIdle() || controllers.size || background.size) { ctx.ui.notify("Status demo is unavailable while agents are running", "warning"); return; }
       clearDemo(ctx);
       navigation.attach(ctx);
       const runs = [createRun({ description: "ホームの git リポジトリ概要調査", prompt: "[demo]", subagent_type: "Explore" })];

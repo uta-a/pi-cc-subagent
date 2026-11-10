@@ -49,6 +49,7 @@ test("detail contains prompt, current activity, bounded history, live response a
   run.activities = Array.from({ length: 40 }, (_, i) => ({ kind: "tool" as const, text: `step-${i}` }));
   const lines = agentDetailLines(run);
   assert.ok(lines.includes("Now: Read(auth.ts)")); assert.ok(lines.includes("Prompt: task"));
+  assert.ok(lines.includes("Usage: 0 cumulative tokens · $0.0000"));
   assert.ok(lines.includes("partial") && lines.includes("answer") && lines.includes("Error: failed"));
   assert.ok(!lines.includes("step-9") && lines.includes("step-10"));
 });
