@@ -2,12 +2,15 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { addUsage, createRun, emptyUsage, failed, type Details, type Task } from "./state.ts";
-import { cap, pooled, runAgent } from "./runner.ts";
+import { pooled, runAgent } from "./runner.ts";
 import { renderRuns } from "./render.ts";
 import { demoRuns } from "./preview.ts";
 import { AgentStatus } from "./status.ts";
 import { AgentNavigation } from "./navigation.ts";
 import { BackgroundAgents, RESULT_MESSAGE_TYPE } from "./background.ts";
+import { FileLocks, mutationPath } from "./locks.ts";
+import { captureContext, type ProjectContext } from "./prompts.ts";
+import { ResultFiles, resultsText } from "./results.ts";
 
 const routingProperties = {
   model: Type.Optional(Type.String({ description: "Available provider/model ID; auto (default) routes by task, inherit keeps the parent model" })),
@@ -22,7 +25,7 @@ const taskProperties = {
   name: Type.Optional(Type.String({ minLength: 1, maxLength: 64, description: "Optional short display name such as researcher or reviewer (shown up to 24 characters); defaults to the agent type" })),
 };
 const schema = Type.Object({
-  run_in_background: Type.Optional(Type.Boolean({ description: "Applies to the whole call. Omitted (default): calls whose tasks are all Explore/Plan run in the background (return immediately, results arrive later in one message); calls with any general-purpose task, or when the 4-agent background capacity is full, wait in the foreground. false: always wait for results. true: require background; every task must be Explore or Plan and capacity must be available, otherwise the call is rejected. Background usage is not added to parent session totals." })),
+  run_in_background: Type.Optional(Type.Boolean({ description: "Applies to the whole call. Omitted (default): every call runs in the background when capacity allows (return immediately, results arrive later in one message); otherwise wait in the foreground. false: always wait. true: require background; reject the entire call before launch if capacity is insufficient. Capacity: 4 background agents total, at most 2 writable (general-purpose or unspecified), counted per task. Background usage is not added to parent session totals." })),
   description: Type.Optional(taskProperties.description),
   prompt: Type.Optional(taskProperties.prompt),
   subagent_type: taskProperties.subagent_type,
@@ -35,7 +38,10 @@ export default function ccSubagent(pi: ExtensionAPI): void {
   const controllers = new Set<AbortController>();
   const status = new AgentStatus();
   const navigation = new AgentNavigation(status);
-  const background = new BackgroundAgents(pi, status);
+  const locks = new FileLocks();
+  const results = new ResultFiles();
+  const background = new BackgroundAgents(pi, status, locks);
+  let context: ProjectContext | undefined;
   pi.on("session_start", (_event, ctx) => {
     const timer = setTimeout(() => {
       timers.delete(timer);
@@ -55,6 +61,8 @@ export default function ccSubagent(pi: ExtensionAPI): void {
   pi.on("session_shutdown", (_event, ctx) => {
     disposed = true;
     background.shutdown();
+    results.shutdown();
+    context = undefined;
     navigation.shutdown();
     if (demoTimer) clearTimeout(demoTimer);
     demoTimer = undefined;
@@ -64,20 +72,31 @@ export default function ccSubagent(pi: ExtensionAPI): void {
     for (const controller of controllers) controller.abort();
     controllers.clear();
   });
-  pi.on("before_agent_start", (_event, ctx) => {
+  pi.on("before_agent_start", (event, ctx) => {
+    try {
+      context = captureContext(event.systemPromptOptions?.contextFiles, event.systemPromptOptions?.cwd ?? ctx.cwd);
+    } catch { context = undefined; }
     clearDemo(ctx);
     navigation.attach(ctx);
+  });
+  pi.on("tool_call", (event, ctx) => {
+    if (event.parentToolCallId !== undefined) return;
+    const path = mutationPath(event.toolName, event.input, ctx.cwd);
+    if (path) return locks.mainCall(event.toolCallId, path);
+  });
+  pi.on("tool_execution_end", event => {
+    if (event.parentToolCallId === undefined) locks.mainEnd(event.toolCallId, event.isError);
   });
   pi.registerTool({
     name: "cc_subagent",
     label: "Agent",
-    description: "Delegate an explicitly authorized task to isolated Pi subagents. Supply description + prompt OR tasks (max 8, concurrency 4). Adapts model and reasoning effort per task; model, effort and profile can be overridden. Preserves parent system instructions and permission checks, with bounded tool calls/output/turns. Explore/Plan are read-only; general-purpose can edit and run commands. Only core tools are exposed; no recursive delegation. By default, calls made only of Explore/Plan tasks run in the background: the tool returns immediately and results are delivered later in one message (at most 4 background agents across calls; otherwise it waits). Calls with general-purpose tasks always wait. Set run_in_background false to wait for read-only results. Background usage is not added to parent session totals. Output is capped at 48 KiB per child and 48 KiB total.",
+    description: "Delegate an explicitly authorized task to isolated Pi subagents. Supply description + prompt OR tasks (max 8, concurrency 4). Adapts model and reasoning effort per task; model, effort and profile can be overridden. Preserves permission checks, with bounded tool calls/output/turns. Explore/Plan use captured project context when available; writers retain full parent system instructions. Explore/Plan are read-only; general-purpose can edit and run commands. Only core tools are exposed; no recursive delegation. By default every call runs in the background when capacity allows: at most 4 background agents, including at most 2 writable agents across calls; otherwise it waits. Set run_in_background false to always wait, true to require capacity or reject before launch. Background write/edit paths are locked until the child settles; main edits are protected while writers run. Bash modifications and foreground children are not guarded. Background usage is not added to parent session totals. Results over 8 KiB return a 2 KiB head plus a temporary full-result file path; UI output is capped at 48 KiB per child and combined parent content at 48 KiB. Budget exhaustion allows one small tool-free partial report request.",
     promptSnippet: "Run isolated subagents with Claude Code-style progress display",
     promptGuidelines: [
       "Use cc_subagent only when the user has authorized delegation; complexity alone is not authorization.",
       "Give cc_subagent a self-contained prompt and short description; optionally set a short name (e.g. researcher, reviewer) to label it in the agent list.",
       "Use cc_subagent tasks for independent parallel work. Never assign overlapping file edits to parallel agents.",
-      "cc_subagent runs Explore/Plan-only calls in the background by default. Keep working on something else, then use the later cc-subagent-result message; do not relaunch the same work or poll. Set run_in_background false when you need the findings before your next step. Background agents survive parent cancellation; /cc-agents-stop stops them.",
+      "cc_subagent runs all calls, including writers, in the background by default when capacity allows. While background writers are running, avoid editing the same files and wait for their result message. Keep working on something else, then use the later cc-subagent-result message; do not relaunch the same work or poll. Set run_in_background false when you need the findings before your next step. Background agents survive parent cancellation; /cc-agents-stop stops them.",
       "Choose cc_subagent model/effort/profile for each task: quick/minimal for targeted exploration, balanced/low for normal edits, deep/medium for difficult design or high-risk work. Avoid extra reviewers or repeated scans for trivial tasks. Leave model auto unless a specific available model is justified.",
     ],
     parameters: schema,
@@ -92,10 +111,10 @@ export default function ccSubagent(pi: ExtensionAPI): void {
       if (tasks.some(t => !t.description.trim() || !t.prompt.trim())) throw new Error("Task descriptions and prompts must not be blank.");
       clearDemo(ctx);
       navigation.attach(ctx);
-      const readOnly = tasks.every(t => t.subagent_type === "Explore" || t.subagent_type === "Plan");
+      const options = { context, results };
       // Explicit true keeps strict validation; the implicit default never fails the call, it just waits instead.
-      if (params.run_in_background === true || (params.run_in_background === undefined && readOnly && background.hasCapacity(tasks.length))) {
-        return background.launch(tasks, ctx);
+      if (params.run_in_background === true || (params.run_in_background === undefined && background.hasCapacity(tasks))) {
+        return background.launch(tasks, ctx, options);
       }
       const runs = tasks.map(createRun);
       const key = Symbol(id);
@@ -128,12 +147,12 @@ export default function ccSubagent(pi: ExtensionAPI): void {
           if (controller.signal.aborted) {
             run.status = "aborted"; run.error = "Interrupted before starting"; update(); return;
           }
-          await runAgent(run, ctx, controller.signal, update);
+          await runAgent(run, ctx, controller.signal, update, options);
         });
         const usage = emptyUsage();
         for (const run of runs) addUsage(usage, run.usage);
         return {
-          content: [{ type: "text" as const, text: cap(runs.map(run => `## ${run.task.description} [${run.status}]\n${run.error ?? run.output}`).join("\n\n")) }],
+          content: [{ type: "text" as const, text: resultsText(runs) }],
           details: snapshot(),
           usage,
           isError: runs.some(failed),

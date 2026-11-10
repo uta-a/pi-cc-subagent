@@ -3,6 +3,16 @@ import type { Message } from "@earendil-works/pi-ai";
 import { resolve } from "node:path";
 import { addUsage, toolLabel, type Run } from "./state.ts";
 import { choosePolicy, LIMITS } from "./policy.ts";
+import { promptBase, roleContract, usesProjectPrompt, type ProjectContext } from "./prompts.ts";
+import { mutationPath, type FileLocks } from "./locks.ts";
+import type { ResultFiles } from "./results.ts";
+
+export interface RunnerOptions {
+  context?: ProjectContext;
+  locks?: FileLocks;
+  results?: ResultFiles;
+  label?: string;
+}
 
 const READ_TOOLS = ["read", "grep", "find", "ls"];
 const WRITE_TOOLS = [...READ_TOOLS, "bash", "write", "edit"];
@@ -35,7 +45,7 @@ export function cap(text: string, bytes = MAX_TEXT): string {
 
 /** Isolated conversation; tools retain the parent's validation and permission hooks. */
 export async function runAgent(
-  run: Run, ctx: ExtensionToolContext, signal: AbortSignal, update: () => void,
+  run: Run, ctx: ExtensionToolContext, signal: AbortSignal, update: () => void, options: RunnerOptions = {},
 ): Promise<void> {
   run.startedAt = Date.now();
   run.status = "running";
@@ -58,18 +68,22 @@ export async function runAgent(
     const allowed = new Set(readOnly ? READ_TOOLS : WRITE_TOOLS);
     const tools = ctx.tools.filter(t => allowed.has(t.name));
     const toolsByName = new Set(tools.map(t => t.name));
-    const system = `${ctx.getSystemPrompt()}\n\n<subagent>\nYou are an isolated ${run.task.subagent_type ?? "general-purpose"} subagent. Work only on the delegated task. Return findings to the supervisor, not directly to the user. Do not delegate further or manage the parent's TODO list. Only these tools are available: ${[...toolsByName].join(", ")}. ${readOnly ? "Read-only task: do not change files or execute commands." : "Coordinate edits through the supervisor; do not change unrelated files."}\nUse find/grep to locate relevant files before reading unknown paths. Read small ranges and batch independent read-only searches in one model turn. Avoid repeated reads and broad scans. read returns at most ${DEFAULT_READ_LINES} lines unless you pass limit (max ${MAX_READ_LINES}); use offset to continue only when needed. Identical read-only calls are not re-executed. Do not rerun passing checks unless the relevant files changed. Return a concise result with evidence and blockers, without narrating every step. Finish as soon as the delegated task is satisfied. Budget: ${limits.turns} model turns and ${limits.toolUses} tool calls.\nWorking directory: ${ctx.cwd}\n</subagent>`;
-    const messages: Message[] = [
-      { role: "system", content: system, toolsAdded: tools, timestamp: Date.now() },
+    const block = `<subagent>\nYou are an isolated ${run.task.subagent_type ?? "general-purpose"} subagent. Work only on the delegated task. Return findings to the supervisor, not directly to the user. Do not delegate further or manage the parent's TODO list. Only these tools are available: ${[...toolsByName].join(", ")}. ${readOnly ? "Read-only task: do not change files or execute commands." : "Coordinate edits through the supervisor; do not change unrelated files."}\nUse find/grep to locate relevant files before reading unknown paths. Read small ranges and batch independent read-only searches in one model turn. Avoid repeated reads and broad scans. read returns at most ${DEFAULT_READ_LINES} lines unless you pass limit (max ${MAX_READ_LINES}); use offset to continue only when needed. Identical read-only calls are not re-executed. Do not rerun passing checks unless the relevant files changed. Return a concise result with evidence and blockers, without narrating every step. Finish as soon as the delegated task is satisfied. Budget: ${limits.turns} model turns and ${limits.toolUses} tool calls.\nWorking directory: ${ctx.cwd}\n${roleContract(run.task.subagent_type)} Keep reports concise. If a file conflict is reported, report it instead of retrying.\n</subagent>`;
+    // Some providers (e.g. claude-bridge) only accept prompts that embed the parent's; see the retry below.
+    let projectPrompt = usesProjectPrompt(run.task.subagent_type, ctx.cwd, options.context);
+    const opening = (): Message[] => [
+      { role: "system", content: `${projectPrompt ? promptBase(run.task.subagent_type, ctx.cwd, () => ctx.getSystemPrompt(), options.context) : ctx.getSystemPrompt()}\n\n${block}`, toolsAdded: tools, timestamp: Date.now() },
       { role: "user", content: run.task.prompt, timestamp: Date.now() },
     ];
+    const messages: Message[] = opening();
     const sessionId = `cc-subagent-${crypto.randomUUID()}`;
     // Successful read-only calls; cleared after anything that may change files.
     const seen = new Set<string>();
+    let budget: string | undefined;
     for (let turn = 0; turn < limits.turns; turn++) {
       signal.throwIfAborted();
       const remainingOutput = limits.output - run.usage.output;
-      if (remainingOutput <= 0) throw new Error(`Agent reached its ${limits.output}-token output budget`);
+      if (remainingOutput <= 0) { budget = "output budget"; break; }
       run.currentActivity = "Waiting for model response…";
       run.liveText = "";
       const maxTokens = Math.min(limits.response, remainingOutput, model.maxTokens || limits.response);
@@ -99,21 +113,38 @@ export async function runAgent(
       update();
       signal.throwIfAborted();
       if (message.stopReason === "aborted") { run.status = "aborted"; throw new Error("Interrupted"); }
-      if (message.stopReason === "error") throw new Error(message.errorMessage || "Model request failed");
+      if (message.stopReason === "error") {
+        if (projectPrompt && turn === 0 && message.usage.output === 0) {
+          // Rejected before producing anything: retry once with the full parent prompt.
+          projectPrompt = false;
+          messages.splice(0, messages.length, ...opening());
+          activity("Provider rejected the project-context prompt; retrying with the full parent prompt", "text");
+          turn--;
+          continue;
+        }
+        throw new Error(message.errorMessage || "Model request failed");
+      }
       const calls = message.content.filter(p => p.type === "toolCall");
       const text = message.content.filter(p => p.type === "text").map(p => p.text).join("\n");
-      if (!calls.length) {
+      if (run.usage.output >= limits.output) budget = "output budget";
+      if (!budget && calls.length && turn + 1 >= limits.turns) budget = "turn budget";
+      if (!calls.length && !budget) {
         if (message.stopReason === "length") throw new Error("Model output limit reached before completion");
         if (message.stopReason === "deferred") throw new Error("Deferred model responses are not supported");
         if (!text.trim()) throw new Error("Agent returned no response");
-        run.output = cap(text);
+        run.output = text;
         run.status = "completed";
         return;
       }
       if (text.trim()) activity(text, "text");
       for (const call of calls) {
         signal.throwIfAborted();
-        if (run.toolUses >= limits.toolUses) throw new Error(`Agent reached its ${limits.toolUses}-call tool budget`);
+        if (!budget && run.toolUses >= limits.toolUses) budget = "tool budget";
+        if (budget) {
+          messages.push({ role: "toolResult", toolCallId: call.id, toolName: call.name,
+            content: [{ type: "text", text: `Budget reached; no more tools. ${budget}; report completed work and what is incomplete.` }], isError: true, timestamp: Date.now() });
+          continue;
+        }
         run.toolUses++;
         const label = toolLabel(call.name, call.arguments);
         run.currentActivity = label;
@@ -122,15 +153,19 @@ export async function runAgent(
         const args = allowed && call.name === "read" ? boundReadArgs(call.arguments) : call.arguments;
         const key = allowed && READ_TOOLS.includes(call.name) ? callKey(call.name, args, ctx.cwd) : undefined;
         const duplicate = key !== undefined && seen.has(key);
+        const path = allowed ? mutationPath(call.name, args, ctx.cwd) : undefined;
+        const conflict = path ? options.locks?.claim(run, path) : undefined;
         // Local allowlist is enforced even if a model invents an unavailable tool.
         const result = !toolsByName.has(call.name)
           ? { content: [{ type: "text" as const, text: `Tool not allowed: ${call.name}` }], isError: true }
           : call.argumentsError
             ? { content: [{ type: "text" as const, text: call.argumentsError }], isError: true }
-            : duplicate
-              // Nothing new is disclosed, so skipping the parent hooks here grants no extra access.
-              ? { content: [{ type: "text" as const, text: `Skipped: an identical ${call.name} call already returned its result earlier in this conversation, and this agent has not changed any files since. Reuse that result.` }], isError: false }
-              : await ctx.executeTool(call.name, args, { signal }).then(outcome => ({ ...outcome.result, isError: outcome.isError }));
+            : conflict
+              ? { content: [{ type: "text" as const, text: conflict }], isError: true }
+              : duplicate
+                // Nothing new is disclosed, so skipping the parent hooks here grants no extra access.
+                ? { content: [{ type: "text" as const, text: `Skipped: an identical ${call.name} call already returned its result earlier in this conversation, and this agent has not changed any files since. Reuse that result.` }], isError: false }
+                : await ctx.executeTool(call.name, args, { signal }).then(outcome => ({ ...outcome.result, isError: outcome.isError }));
         if (duplicate) activity(`${label} — duplicate skipped`, "tool");
         else if (key && !result.isError) seen.add(key);
         if (allowed && MUTATING_TOOLS.has(call.name)) seen.clear();
@@ -139,12 +174,38 @@ export async function runAgent(
         const content = result.content.map(part => part.type === "text" ? { ...part, text: cap(part.text, limits.toolBytes) } : part);
         messages.push({ role: "toolResult", toolCallId: call.id, toolName: call.name, content, isError: !!result.isError, timestamp: Date.now() });
       }
+      if (!budget && run.toolUses >= limits.toolUses) budget = "tool budget";
+      if (budget) break;
     }
-    throw new Error(`Agent exceeded ${limits.turns} model turns`);
+    budget ??= "turn budget";
+    signal.throwIfAborted();
+    run.error = `Budget reached (${budget}); partial report below`;
+    // One small tool-free report may overrun the normal turn/output budgets.
+    messages.push({ role: "user", content: `Budget reached (${budget}); no more tools. Give your concise role report now, including completed work, validation actually run, and what is incomplete. ${roleContract(run.task.subagent_type)}`, timestamp: Date.now() });
+    try {
+      run.currentActivity = "Writing partial report…";
+      update();
+      const stream = ctx.modelRegistry.streamSimple(model, { messages }, {
+        signal, sessionId, toolChoice: "none", maxTokens: Math.min(1024, model.maxTokens || 1024),
+      });
+      for await (const _event of stream) { signal.throwIfAborted(); }
+      const message = await stream.result();
+      signal.throwIfAborted();
+      addUsage(run.usage, message.usage);
+      run.tokens = message.usage.input + message.usage.output + message.usage.cacheRead + message.usage.cacheWrite;
+      if (message.stopReason === "aborted") { run.status = "aborted"; throw new Error("Interrupted"); }
+      if (message.stopReason !== "error") run.output = message.content.filter(p => p.type === "text").map(p => p.text).join("\n");
+    } catch (error) {
+      if (signal.aborted || run.status === "aborted") throw error;
+      // Preserve the budget error if the final report request fails.
+    }
+    run.status = "failed";
   } catch (error) {
     run.status = signal.aborted || run.status === "aborted" ? "aborted" : "failed";
     run.error = signal.aborted ? "Interrupted" : cap(error instanceof Error ? error.message : String(error), 2048);
   } finally {
+    if (options.results) run.resultText = options.results.format([run.error, run.output].filter(Boolean).join("\n\n"), options.label ?? run.task.name ?? run.task.subagent_type ?? "worker");
+    run.output = cap(run.output);
     run.durationMs = Date.now() - run.startedAt;
     run.currentActivity = run.status;
     run.liveText = undefined;

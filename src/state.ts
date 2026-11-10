@@ -28,6 +28,8 @@ export interface Run {
   usage: Usage;
   activities: Activity[];
   output: string;
+  /** Bounded model-facing result; full UI output remains in output. */
+  resultText?: string;
   liveText?: string;
   currentActivity?: string;
   model?: string;
