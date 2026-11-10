@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage, Message, SimpleStreamOptions, Api, Model } from "@earendil-works/pi-ai";
+import type { AssistantMessage, JsonObject, Message, SimpleStreamOptions, Api, Model } from "@earendil-works/pi-ai";
 import { createRun, emptyUsage } from "../src/state.ts";
-import { cap, MAX_TURNS, pooled, runAgent } from "../src/runner.ts";
+import { boundReadArgs, callKey, cap, DEFAULT_READ_LINES, MAX_READ_LINES, MAX_TURNS, pooled, runAgent } from "../src/runner.ts";
 
 function message(text = "Found it", tool?: string): AssistantMessage {
   return {
@@ -12,7 +12,12 @@ function message(text = "Found it", tool?: string): AssistantMessage {
     stopReason: tool ? "toolUse" : "stop", timestamp: Date.now(),
   };
 }
-function harness(responses: AssistantMessage[], execute?: (name: string) => void) {
+function toolCalls(...calls: [string, JsonObject][]): AssistantMessage {
+  const m = message("", "read");
+  m.content = calls.map(([name, args], i) => ({ type: "toolCall" as const, id: `c${Math.random()}-${i}`, name, arguments: args }));
+  return m;
+}
+function harness(responses: AssistantMessage[], execute?: (name: string, args: Record<string, unknown>) => void) {
   let requests = 0;
   const conversations: Message[][] = [];
   const choices: { model: unknown; options: SimpleStreamOptions }[] = [];
@@ -26,8 +31,8 @@ function harness(responses: AssistantMessage[], execute?: (name: string) => void
       const response = responses[Math.min(requests++, responses.length - 1)];
       return { async *[Symbol.asyncIterator]() {}, result: async () => response };
     } },
-    executeTool: async (name: string) => {
-      execute?.(name);
+    executeTool: async (name: string, args: Record<string, unknown>) => {
+      execute?.(name, args);
       return { isError: false, result: { content: [{ type: "text", text: "file contents" }], details: {} } };
     },
   } as unknown as ExtensionToolContext;
@@ -84,13 +89,65 @@ test("cumulative output budget prevents another model request", async () => {
 });
 test("tool-call budget bounds oversized batches without an automatic retry", async () => {
   const batch = message("", "read");
-  batch.content = Array.from({ length: 30 }, (_, i) => ({ type: "toolCall" as const, id: `t${i}`, name: "read", arguments: { path: "file.ts" } }));
+  batch.content = Array.from({ length: 30 }, (_, i) => ({ type: "toolCall" as const, id: `t${i}`, name: "read", arguments: { path: `file-${i}.ts` } }));
   let calls = 0;
   const h = harness([batch], () => { calls++; });
   const run = createRun({ description: "Work", prompt: "Work" });
   await runAgent(run, h.ctx, new AbortController().signal, () => {});
   assert.equal(calls, 24); assert.equal(h.requests(), 1); assert.equal(run.status, "failed");
   assert.match(run.error!, /tool budget/);
+});
+test("read limits default to a bounded range and clamp oversized requests", () => {
+  assert.deepEqual(boundReadArgs({ path: "a.ts" }), { path: "a.ts", limit: DEFAULT_READ_LINES });
+  assert.deepEqual(boundReadArgs({ path: "a.ts", offset: 40, limit: 1000 }), { path: "a.ts", offset: 40, limit: MAX_READ_LINES });
+  assert.deepEqual(boundReadArgs({ path: "a.ts", limit: 50 }), { path: "a.ts", limit: 50 });
+  for (const limit of [0, -1, 1.5, "20"]) assert.equal(boundReadArgs({ path: "a.ts", limit }).limit, DEFAULT_READ_LINES);
+});
+test("child read calls reach the parent tool with the bounded limit", async () => {
+  const seen: Record<string, unknown>[] = [];
+  const h = harness([toolCalls(["read", { path: "big.ts" }], ["read", { path: "big.ts", offset: 200, limit: 9999 }]), message()], (_n, args) => seen.push(args));
+  await runAgent(createRun({ description: "Read", prompt: "Read", subagent_type: "Explore" }), h.ctx, new AbortController().signal, () => {});
+  assert.deepEqual(seen, [{ path: "big.ts", limit: 200 }, { path: "big.ts", offset: 200, limit: 500 }]);
+});
+test("identical read-only calls are skipped across turns, including equivalent paths", async () => {
+  let calls = 0;
+  const h = harness([
+    toolCalls(["read", { path: "src/a.ts" }]),
+    toolCalls(["read", { path: "/tmp/src/a.ts" }], ["read", { path: "@src/a.ts", limit: 200 }], ["read", { path: "src/a.ts", offset: 200 }]),
+    message(),
+  ], () => { calls++; });
+  const run = createRun({ description: "Read", prompt: "Read", subagent_type: "Explore" });
+  await runAgent(run, h.ctx, new AbortController().signal, () => {});
+  assert.equal(calls, 2); // first read + the new offset; both equivalent repeats skipped
+  const results = h.conversations[2].filter(m => m.role === "toolResult");
+  const texts = results.map(m => m.role === "toolResult" && m.content[0].type === "text" ? m.content[0].text : "");
+  assert.match(texts[1], /^Skipped: an identical read call/); assert.match(texts[2], /^Skipped/);
+  assert.equal(texts[3], "file contents");
+  assert.equal(run.activities.filter(a => a.text.endsWith("duplicate skipped")).length, 2);
+  assert.equal(run.status, "completed");
+});
+test("file-changing tools invalidate the duplicate cache", async () => {
+  const names: string[] = [];
+  const h = harness([
+    toolCalls(["read", { path: "a.ts" }]),
+    toolCalls(["bash", { command: "sed -i s/a/b/ a.ts" }]),
+    toolCalls(["read", { path: "a.ts" }]),
+    message(),
+  ], name => names.push(name));
+  await runAgent(createRun({ description: "Edit", prompt: "Edit" }), h.ctx, new AbortController().signal, () => {});
+  assert.deepEqual(names, ["read", "bash", "read"]);
+});
+test("failed read-only calls are not cached and can be retried", async () => {
+  let calls = 0;
+  const h = harness([toolCalls(["read", { path: "a.ts" }]), toolCalls(["read", { path: "a.ts" }]), message()]);
+  h.ctx.executeTool = async () => ({ toolCall: {} as never, isError: ++calls === 1, result: { content: [{ type: "text", text: calls === 1 ? "EBUSY" : "ok" }], details: {} } });
+  await runAgent(createRun({ description: "Read", prompt: "Read", subagent_type: "Explore" }), h.ctx, new AbortController().signal, () => {});
+  assert.equal(calls, 2);
+});
+test("call keys distinguish tools and arguments but not equivalent path spellings", () => {
+  assert.equal(callKey("read", { path: "a.ts", limit: 200 }, "/w"), callKey("read", { limit: 200, path: "/w/a.ts" }, "/w"));
+  assert.notEqual(callKey("read", { path: "a.ts" }, "/w"), callKey("grep", { path: "a.ts" }, "/w"));
+  assert.notEqual(callKey("grep", { pattern: "x", path: "src" }, "/w"), callKey("grep", { pattern: "y", path: "src" }, "/w"));
 });
 test("automatic routing respects scoped models", async () => {
   const h = harness([message()]);
