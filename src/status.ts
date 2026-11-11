@@ -16,10 +16,9 @@ export function agentRole(run: Run): "explore" | "plan" | "worker" {
   return "worker";
 }
 
-/** Base footer label: the caller's name, otherwise the role (Explore / Plan / worker). */
+/** Base footer label: the caller's name, otherwise its loaded agent type. */
 export function baseLabel(run: Run): string {
-  const role = agentRole(run);
-  return customName(run.task) ?? (role === "explore" ? "Explore" : role === "plan" ? "Plan" : "worker");
+  return customName(run.task) ?? run.task.subagent_type ?? "general-purpose";
 }
 
 /** CC's footer shows live agents, not completed transcript rows. Dot labels are our adaptation. */

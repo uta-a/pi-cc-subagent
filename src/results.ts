@@ -2,12 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { Run } from "./state.ts";
 import { cap } from "./runner.ts";
-
-export function reportText(run: Run): string {
-  return [run.error, run.output].filter(Boolean).join("\n\n");
-}
 
 /** Synchronous writes keep shutdown cleanup atomic with result publication. */
 export class ResultFiles {
@@ -41,8 +36,4 @@ export class ResultFiles {
     for (const path of this.files) { try { fs.unlinkSync(path); } catch {} }
     this.files.clear();
   }
-}
-
-export function resultsText(runs: Run[]): string {
-  return cap(runs.map(run => `## ${run.task.description} [${run.status}]\n${run.resultText ?? reportText(run)}`).join("\n\n"));
 }

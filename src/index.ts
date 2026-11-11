@@ -1,211 +1,164 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { addUsage, createRun, emptyUsage, failed, type Details, type Task } from "./state.ts";
-import { pooled, runAgent } from "./runner.ts";
+import { createRun, type Details } from "./state.ts";
 import { renderRuns } from "./render.ts";
 import { demoRuns } from "./preview.ts";
 import { AgentStatus } from "./status.ts";
-import { AgentNavigation } from "./navigation.ts";
+import { AgentNavigation, safeText } from "./navigation.ts";
 import { BackgroundAgents, RESULT_MESSAGE_TYPE } from "./background.ts";
 import { FileLocks, mutationPath } from "./locks.ts";
 import { captureContext, type ProjectContext } from "./prompts.ts";
-import { ResultFiles, resultsText } from "./results.ts";
+import { ResultFiles } from "./results.ts";
+import { Definitions, agentListing } from "./definitions.ts";
+import { settings } from "./settings.ts";
+import { resolvePolicy } from "./policy.ts";
+import { AGENT_PROMPT, SEND_PROMPT, FIELD_DESCRIPTIONS as D } from "./cc-texts.ts";
 
-const routingProperties = {
-  model: Type.Optional(Type.String({ description: "Available provider/model ID; auto (default) routes by task, inherit keeps the parent model" })),
-  effort: Type.Optional(Type.Union((["auto", "off", "minimal", "low", "medium", "high"] as const).map(value => Type.Literal(value)), { description: "Reasoning effort for this task; auto adapts to the profile" })),
-  profile: Type.Optional(Type.Union((["auto", "quick", "balanced", "deep"] as const).map(value => Type.Literal(value)), { description: "Task complexity/cost profile; auto uses task type and risk keywords" })),
-};
-const taskProperties = {
-  ...routingProperties,
-  description: Type.String({ minLength: 1, maxLength: 120, description: "Short task description (3–5 words)" }),
-  prompt: Type.String({ minLength: 1, maxLength: 50000, description: "Self-contained task; the agent does not see parent conversation history" }),
-  subagent_type: Type.Optional(Type.Union([Type.Literal("Explore"), Type.Literal("Plan"), Type.Literal("general-purpose")], { description: "Explore and Plan are read-only; general-purpose can edit files and run bash" })),
-  name: Type.Optional(Type.String({ minLength: 1, maxLength: 64, description: "Optional short display name such as researcher or reviewer (shown up to 24 characters); defaults to the agent type" })),
-};
-const schema = Type.Object({
-  run_in_background: Type.Optional(Type.Boolean({ description: "Applies to the whole call. Omitted (default): every call runs in the background when capacity allows (return immediately, results arrive later in one message); otherwise wait in the foreground. false: always wait. true: require background; reject the entire call before launch if capacity is insufficient. Capacity: 4 background agents total, at most 2 writable (general-purpose or unspecified), counted per task. Background usage is not added to parent session totals." })),
-  description: Type.Optional(taskProperties.description),
-  prompt: Type.Optional(taskProperties.prompt),
-  subagent_type: taskProperties.subagent_type,
-  name: taskProperties.name,
-  ...routingProperties,
-  tasks: Type.Optional(Type.Array(Type.Object(taskProperties), { minItems: 1, maxItems: 8, description: "Independent tasks to execute in parallel (up to 4 concurrently)" })),
-});
+export const agentSchema = Type.Object({
+  description: Type.String({ description: D.description }),
+  prompt: Type.String({ description: D.prompt }),
+  subagent_type: Type.Optional(Type.String({ description: D.subagent_type })),
+  model: Type.Optional(Type.Union((["sonnet", "opus", "haiku", "fable"] as const).map(value => Type.Literal(value)), { description: D.model })),
+  effort: Type.Optional(Type.Union((["low", "medium", "high", "xhigh", "max"] as const).map(value => Type.Literal(value)), { description: D.effort })),
+  run_in_background: Type.Optional(Type.Boolean({ description: D.run_in_background })),
+  name: Type.Optional(Type.String({ description: D.name })),
+}, { additionalProperties: false });
 
 export default function ccSubagent(pi: ExtensionAPI): void {
-  const controllers = new Set<AbortController>();
   const status = new AgentStatus();
   const navigation = new AgentNavigation(status);
   const locks = new FileLocks();
   const results = new ResultFiles();
   const background = new BackgroundAgents(pi, status, locks);
+  const definitions = new Definitions();
+  const childCallRoots = new Set<string>();
+  const load = (ctx: ExtensionContext, force = false) => definitions.load(ctx.cwd, message => ctx.ui.notify(message, "warning"), force);
   let context: ProjectContext | undefined;
-  pi.on("session_start", (_event, ctx) => {
-    const timer = setTimeout(() => {
-      timers.delete(timer);
-      if (!disposed) navigation.attach(ctx);
-    }, 0);
-    timers.add(timer);
-  });
-  const timers = new Set<ReturnType<typeof setInterval>>();
-  const demoKey = Symbol("demo");
   let disposed = false;
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  const demoKey = Symbol("demo");
   let demoTimer: ReturnType<typeof setTimeout> | undefined;
   const clearDemo = (ctx: ExtensionContext) => {
     if (demoTimer) clearTimeout(demoTimer);
     demoTimer = undefined;
     status.release(demoKey, ctx);
   };
+  pi.on("session_start", (_event, ctx) => {
+    load(ctx, true);
+    const timer = setTimeout(() => { timers.delete(timer); if (!disposed) navigation.attach(ctx); }, 0);
+    timers.add(timer);
+  });
   pi.on("session_shutdown", (_event, ctx) => {
     disposed = true;
     background.shutdown();
     results.shutdown();
     context = undefined;
+    childCallRoots.clear();
     navigation.shutdown();
     if (demoTimer) clearTimeout(demoTimer);
-    demoTimer = undefined;
-    for (const timer of timers) clearInterval(timer);
+    for (const timer of timers) clearTimeout(timer);
     timers.clear();
     status.shutdown(ctx);
-    for (const controller of controllers) controller.abort();
-    controllers.clear();
   });
   pi.on("before_agent_start", (event, ctx) => {
-    try {
-      context = captureContext(event.systemPromptOptions?.contextFiles, event.systemPromptOptions?.cwd ?? ctx.cwd);
-    } catch { context = undefined; }
+    context = captureContext(event.systemPromptOptions?.contextFiles, event.systemPromptOptions?.cwd ?? ctx.cwd);
     clearDemo(ctx);
     navigation.attach(ctx);
+    const active = new Set(pi.getActiveTools());
+    const listing = agentListing(load(ctx), pi.getAllTools().filter(tool => active.has(tool.name)));
+    return { systemPrompt: `${event.systemPrompt}\n\n<system-reminder>\n${listing}\nWhen you launch multiple agents for independent work, send them in a single message with multiple Agent calls.\n</system-reminder>` };
   });
+  const fromChild = (parent: string | undefined) => parent !== undefined && [...childCallRoots].some(root => parent === root || parent.startsWith(`${root}/`));
   pi.on("tool_call", (event, ctx) => {
-    if (event.parentToolCallId !== undefined) return;
+    if (fromChild(event.parentToolCallId)) {
+      if (["Agent", "SendMessage", "TaskStop"].includes(event.toolName)) return { block: true, reason: "Subagents cannot call Agent, SendMessage or TaskStop." };
+      // Child write/edit calls are claimed by the runner itself.
+      return;
+    }
+    // Top-level main calls and nested calls made by main's own tools count as main.
+    if (!settings(pi).fileLocks) return;
     const path = mutationPath(event.toolName, event.input, ctx.cwd);
     if (path) return locks.mainCall(event.toolCallId, path);
   });
   pi.on("tool_execution_end", event => {
-    if (event.parentToolCallId === undefined) locks.mainEnd(event.toolCallId, event.isError);
+    if (!fromChild(event.parentToolCallId)) locks.mainEnd(event.toolCallId, event.isError);
   });
   pi.registerTool({
-    name: "cc_subagent",
-    label: "Agent",
-    description: "Delegate an explicitly authorized task to isolated Pi subagents. Supply description + prompt OR tasks (max 8, concurrency 4). Adapts model and reasoning effort per task; model, effort and profile can be overridden. Preserves permission checks, with bounded tool calls/output/turns. Explore/Plan use captured project context when available; writers retain full parent system instructions. Explore/Plan are read-only; general-purpose can edit and run commands. Only core tools are exposed; no recursive delegation. By default every call runs in the background when capacity allows: at most 4 background agents, including at most 2 writable agents across calls; otherwise it waits. Set run_in_background false to always wait, true to require capacity or reject before launch. Background write/edit paths are locked until the child settles; main edits are protected while writers run. Bash modifications and foreground children are not guarded. Background usage is not added to parent session totals. Results over 8 KiB return a 2 KiB head plus a temporary full-result file path; UI output is capped at 48 KiB per child and combined parent content at 48 KiB. Budget exhaustion allows one small tool-free partial report request.",
-    promptSnippet: "Run isolated subagents with Claude Code-style progress display",
-    promptGuidelines: [
-      "Use cc_subagent only when the user has authorized delegation; complexity alone is not authorization.",
-      "Give cc_subagent a self-contained prompt and short description; optionally set a short name (e.g. researcher, reviewer) to label it in the agent list.",
-      "Use cc_subagent tasks for independent parallel work. Never assign overlapping file edits to parallel agents.",
-      "cc_subagent runs all calls, including writers, in the background by default when capacity allows. While background writers are running, avoid editing the same files and wait for their result message. Keep working on something else, then use the later cc-subagent-result message; do not relaunch the same work or poll. Set run_in_background false when you need the findings before your next step. Background agents survive parent cancellation; /cc-agents-stop stops them.",
-      "Choose cc_subagent model/effort/profile for each task: quick/minimal for targeted exploration, balanced/low for normal edits, deep/medium for difficult design or high-risk work. Avoid extra reviewers or repeated scans for trivial tasks. Leave model auto unless a specific available model is justified.",
-    ],
-    parameters: schema,
-    renderShell: "self",
+    name: "Agent", label: "Agent", description: AGENT_PROMPT,
+    promptSnippet: "Launch a new agent", parameters: agentSchema, renderShell: "self",
     async execute(id, params, signal, onUpdate, ctx) {
       if (disposed) throw new Error("Subagent extension has shut down");
-      const hasSingle = params.description !== undefined || params.prompt !== undefined || params.subagent_type !== undefined || params.name !== undefined || params.model !== undefined || params.effort !== undefined || params.profile !== undefined;
-      if ((params.tasks !== undefined && hasSingle) || (!params.tasks && (!params.description || !params.prompt))) {
-        throw new Error("Provide description + prompt OR tasks, not both.");
-      }
-      const tasks: Task[] = params.tasks ?? [{ description: params.description!, prompt: params.prompt!, subagent_type: params.subagent_type, name: params.name, model: params.model, effort: params.effort, profile: params.profile }];
-      if (tasks.some(t => !t.description.trim() || !t.prompt.trim())) throw new Error("Task descriptions and prompts must not be blank.");
+      const active = load(ctx);
+      const type = params.subagent_type ?? "general-purpose";
+      const definition = active.find(def => def.name === type);
+      if (!definition) throw new Error(`Agent type "${type}" not found. Available types: ${active.map(def => def.name).join(", ")}`);
+      if (!ctx.model) throw new Error("Select a Pi model before running a subagent.");
+      const config = settings(pi);
+      const task = { ...params, subagent_type: type };
+      const available = ctx.modelRegistry.getAvailable();
+      const scoped = ctx.scopedModels?.length ? available.filter(model => ctx.scopedModels.some(entry => entry.model.provider === model.provider && entry.model.id === model.id)) : available;
+      const policy = resolvePolicy(task, definition, config, ctx.model, available, pi.getThinkingLevel(), scoped);
       clearDemo(ctx);
       navigation.attach(ctx);
-      const options = { context, results };
-      // Explicit true keeps strict validation; the implicit default never fails the call, it just waits instead.
-      if (params.run_in_background === true || (params.run_in_background === undefined && background.hasCapacity(tasks))) {
-        return background.launch(tasks, ctx, options);
-      }
-      const runs = tasks.map(createRun);
-      const key = Symbol(id);
-      status.track(key, runs);
-      const controller = new AbortController();
-      const abort = () => controller.abort();
-      if (signal?.aborted) abort();
-      signal?.addEventListener("abort", abort, { once: true });
-      controllers.add(controller);
-      const snapshot = (): Details => structuredClone({ runs });
-      let lastSnapshotAt = -Infinity;
-      let lastSnapshotState = "";
-      const update = () => {
-        if (disposed) return;
-        status.publish(ctx);
-        const now = Date.now();
-        const state = runs.map(run => run.status).join(",");
-        if (now - lastSnapshotAt < 1000 && state === lastSnapshotState) return;
-        lastSnapshotAt = now;
-        lastSnapshotState = state;
-        onUpdate?.({ content: [{ type: "text", text: "Subagents in progress" }], details: snapshot() });
-      };
-      // Footer time updates do not clone or resend the child transcript.
-      const timer = setInterval(() => { if (!disposed) status.publish(ctx); }, 1000);
-      timers.add(timer);
-      timer.unref();
-      try {
-        update();
-        await pooled(runs, 4, async run => {
-          if (controller.signal.aborted) {
-            run.status = "aborted"; run.error = "Interrupted before starting"; update(); return;
-          }
-          await runAgent(run, ctx, controller.signal, update, options);
-        });
-        const usage = emptyUsage();
-        for (const run of runs) addUsage(usage, run.usage);
-        return {
-          content: [{ type: "text" as const, text: resultsText(runs) }],
-          details: snapshot(),
-          usage,
-          isError: runs.some(failed),
-        };
-      } finally {
-        clearInterval(timer);
-        timers.delete(timer);
-        signal?.removeEventListener("abort", abort);
-        controllers.delete(controller);
-        status.release(key, ctx);
-      }
+      childCallRoots.add(id);
+      return background.launch(task, ctx, { context, results, definition, config, policy }, definition.background === true || params.run_in_background !== false, signal,
+        details => onUpdate?.({ content: [{ type: "text", text: "Agent in progress" }], details }));
     },
     renderCall() { return new Container(); },
-    renderResult(result, { expanded }, theme, context) {
+    renderResult(result, { expanded }, theme, renderer) {
       const details = result.details as Details | undefined;
-      if (details?.background || !details?.runs?.length) {
-        return new Text(result.content.filter(p => p.type === "text").map(p => p.text).join("\n"), 0, 0);
-      }
-      return renderRuns(details.runs, theme, {
-        expanded,
-        hint: context.keyHint("app.tools.expand", "to expand"),
-        rows: process.stdout.rows,
-      });
+      if (details?.background) return new Text(`Agent launched: ${safeText(details.runs[0].task.name ?? details.runs[0].task.subagent_type ?? "general-purpose")} (${safeText(details.runs[0].task.description)})`, 0, 0);
+      if (!details?.runs?.length) return new Text(result.content.filter(p => p.type === "text").map(p => p.text).join("\n"), 0, 0);
+      return renderRuns(details.runs, theme, { expanded, hint: renderer.keyHint("app.tools.expand", "to expand"), rows: process.stdout.rows });
+    },
+  });
+  pi.registerTool({
+    name: "SendMessage", label: "SendMessage", description: SEND_PROMPT, promptSnippet: "Send a message to another agent",
+    parameters: Type.Object({ to: Type.String(), message: Type.String(), summary: Type.Optional(Type.String()) }, { additionalProperties: false }),
+    async execute(id, params, _signal, _onUpdate, ctx) {
+      childCallRoots.add(id);
+      return { content: [{ type: "text", text: JSON.stringify(background.send(params.to, params.message, ctx, settings(pi))) }], details: undefined };
+    },
+    renderCall(args) { return new Text(safeText(`SendMessage → ${args.to ?? ""}: ${args.summary ?? args.message?.split("\n")[0] ?? ""}`).replaceAll("\n", " "), 0, 0); },
+    renderResult(result, _options, _theme, renderer) {
+      return renderer.isError ? new Text(result.content.filter(p => p.type === "text").map(p => p.text).join("\n"), 0, 0) : new Container();
+    },
+  });
+  pi.registerTool({
+    name: "TaskStop", label: "Stop Task", description: "Stop a running background task by ID",
+    parameters: Type.Object({ task_id: Type.Optional(Type.String()), shell_id: Type.Optional(Type.String({ description: "Deprecated alias for task_id" })) }, { additionalProperties: false }),
+    async execute(_id, params) {
+      return { content: [{ type: "text", text: JSON.stringify(background.stopTask(params.task_id ?? params.shell_id)) }], details: undefined };
+    },
+    renderCall(args) { return new Text(safeText(`Stop Task ${args.task_id ?? args.shell_id ?? ""}`).replaceAll("\n", " "), 0, 0); },
+    renderResult(result, _options, _theme, renderer) {
+      return renderer.isError ? new Text(result.content.filter(p => p.type === "text").map(p => p.text).join("\n"), 0, 0) : new Container();
     },
   });
   pi.registerMessageRenderer(RESULT_MESSAGE_TYPE, (message, options, theme) => {
     const details = message.details as Details;
-    return renderRuns(details.runs, theme, {
-      expanded: options.expanded,
-      hint: options.keyHint("app.tools.expand", "to expand"),
-      rows: process.stdout.rows,
-    });
+    return renderRuns(details.runs, theme, { expanded: options.expanded, hint: options.keyHint("app.tools.expand", "to expand"), rows: process.stdout.rows });
   });
   pi.registerCommand("cc-agents-stop", {
-    description: "Stop background agents: /cc-agents-stop [display-name] (no argument stops all)",
+    description: "Stop background agents: /cc-agents-stop [id or name] (no argument stops all)",
     handler: async (args, ctx) => {
       const count = background.stop(args.trim() || undefined);
       ctx.ui.notify(count ? `Stopping ${count} background agent(s)` : "No matching background agents", "info");
     },
   });
   pi.registerCommand("cc-agent", {
-    description: "Delegate a task: /cc-agent [Explore|Plan|general-purpose] <task>",
+    description: "Delegate a task: /cc-agent [agent type] <task>",
     handler: async (args, ctx) => {
-      const match = args.trim().match(/^(?:(Explore|Plan|general-purpose)\s+)?([\s\S]+)$/);
-      if (!match) { ctx.ui.notify("Usage: /cc-agent [Explore|Plan|general-purpose] <task>", "info"); return; }
-      const task = { subagent_type: match[1] ?? "general-purpose", description: match[2].slice(0, 80), prompt: match[2] };
-      pi.sendUserMessage(`I authorize delegation of this task. Call cc_subagent with these arguments, then summarize the result:\n${JSON.stringify(task)}`, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+      const match = args.trim().match(/^(?:(\S+)\s+)?([\s\S]+)$/);
+      if (!match) { ctx.ui.notify("Usage: /cc-agent [agent type] <task>", "info"); return; }
+      const known = load(ctx).some(def => def.name === match[1]);
+      const prompt = known ? match[2] : args.trim();
+      const task = { subagent_type: known ? match[1] : "general-purpose", description: prompt.slice(0, 80), prompt };
+      pi.sendUserMessage(`Call Agent with these arguments, then summarize the result when it arrives:\n${JSON.stringify(task)}`, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
     },
   });
-  pi.registerEntryRenderer("cc-subagent-preview", (entry, options, theme) => {
-    const details = entry.data as Details;
-    return renderRuns(details.runs, theme, { expanded: options.expanded, hint: options.keyHint("app.tools.expand", "to expand") });
-  });
+  pi.registerEntryRenderer("cc-subagent-preview", (entry, options, theme) => renderRuns((entry.data as Details).runs, theme, { expanded: options.expanded, hint: options.keyHint("app.tools.expand", "to expand") }));
   pi.registerCommand("cc-agents", {
     description: "View live subagent activity (↑↓ switch; main/Enter/Esc returns)",
     handler: async (_args, ctx) => {
@@ -213,8 +166,8 @@ export default function ccSubagent(pi: ExtensionAPI): void {
       navigation.attach(ctx);
       if (!status.selectedRun) {
         if (!status.running().length) { ctx.ui.notify("No running subagents", "info"); return; }
-        if (!status.selecting) status.move(1, ctx); // chat → main
-        status.move(1, ctx); // main → first child
+        if (!status.selecting) status.move(1, ctx);
+        status.move(1, ctx);
       }
       await navigation.open(ctx);
     },
@@ -225,15 +178,14 @@ export default function ccSubagent(pi: ExtensionAPI): void {
       if (ctx.mode !== "tui") { ctx.ui.notify("Demo requires interactive mode", "warning"); return; }
       if (args.trim() && args.trim() !== "off") { ctx.ui.notify("Usage: /cc-subagent-status-demo [off]", "info"); return; }
       if (args.trim() === "off") { clearDemo(ctx); return; }
-      if (!ctx.isIdle() || controllers.size || background.size) { ctx.ui.notify("Status demo is unavailable while agents are running", "warning"); return; }
+      if (!ctx.isIdle() || background.size) { ctx.ui.notify("Status demo is unavailable while agents are running", "warning"); return; }
       clearDemo(ctx);
       navigation.attach(ctx);
-      const runs = [createRun({ description: "ホームの git リポジトリ概要調査", prompt: "[demo]", subagent_type: "Explore" })];
-      Object.assign(runs[0], { status: "running", startedAt: Date.now() - 6000, tokens: 26400 });
-      runs[0].activities.push({ kind: "tool", text: "List repositories" });
-      status.track(demoKey, runs);
+      const run = createRun({ description: "ホームの git リポジトリ概要調査", prompt: "[demo]", subagent_type: "Explore" });
+      Object.assign(run, { status: "running", startedAt: Date.now() - 6000, tokens: 26400 });
+      run.activities.push({ kind: "tool", text: "List repositories" });
+      status.track(demoKey, [run]);
       status.publish(ctx);
-      ctx.ui.notify("Synthetic status demo: main / Explore (10s)", "info");
       demoTimer = setTimeout(() => clearDemo(ctx), 10_000);
       demoTimer.unref();
     },

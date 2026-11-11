@@ -1,13 +1,13 @@
 {
   "name": "pi-cc-subagent",
   "version": "0.1.0",
-  "description": "Pi subagents with source-verified Claude Code style terminal rendering",
+  "description": "Claude Code 2.1.322-style Agent, SendMessage and TaskStop for Pi with live subagent UI",
   "type": "module",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/uta-a/pi-cc-subagent.git" },
   "homepage": "https://github.com/uta-a/pi-cc-subagent#readme",
   "bugs": { "url": "https://github.com/uta-a/pi-cc-subagent/issues" },
-  "keywords": ["pi-package"],
+  "keywords": ["pi-package", "subagents", "claude-code", "agent"],
   "files": ["src", "README.md", "docs"],
   "pi": { "extensions": ["./src/index.ts"] },
   "scripts": {

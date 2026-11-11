@@ -1,6 +1,42 @@
-# Claude Code 表示コードの参照記録
+# Claude Code 表示・サブエージェント仕様の参照記録
 
-## 一次資料
+## サブエージェント動作の更新（2.1.322）
+
+今回の動作仕様は次を一次資料とする提供参照文書に基づきます。
+
+- 公式バイナリ：`~/.local/share/claude/versions/2.1.322`（Bun compiled）
+- SHA-256：`a9d237949db816a0b7afd88a9a8e1df36b3a597a30f5a41d1c0539eb180a3450`
+- この作業でも上記ファイルを `shasum -a 256` で照合し、一致を確認しました。バイナリの起動・再抽出・npm からの再取得はしていません。
+- 提供参照文書は公式バイナリの埋め込み文字列・挙動の調査と、`@anthropic-ai/claude-code@2.1.322` の `sdk-tools.d.ts` による AgentInput の確認をまとめたものです。
+
+元の実装コード・バイナリは同梱しません。`src/cc-texts.ts` に必要なモデル向けの文言を保持し、制御フローは Pi API を使って独立実装しました。参照内のテンプレートは通常の非 team / 非 coordinator / 非 fork 構成を対象としています。すべての内部モードを検証したという意味ではありません。
+
+| 参照文書の節 | 採用した契約 | Pi 側の実装 |
+|---|---|---|
+| 1–2 | Agent の7引数、既定背景、同時20件、拒否文、起動例、定義一覧 | `src/index.ts`, `src/background.ts`, `src/cc-texts.ts` |
+| 3 | general-purpose / Explore / Plan の用途・system prompt | `src/definitions.ts`, `src/cc-texts.ts` |
+| 4, 10–11 | authority note、Notes、claudeMd / currentDate、Environment、通常は親 system を含めない | `src/prompts.ts`, `src/runner.ts` |
+| 5 | 前景の agentId / usage、Explore / Plan の本文のみ返却、async_launched の output file なし版 | `src/formats.ts` |
+| 6 | completed / failed / killed、ターン上限の summary と継続案内、1実行1通知 | `src/formats.ts`, `src/background.ts` |
+| 7–8 | SendMessage のキュー・同一ID再開・latest-wins、TaskStop | `src/background.ts` |
+| 9 | ユーザー／プロジェクトの定義、上書き順、frontmatter の対象フィールド | `src/definitions.ts` |
+
+短い識別用の文言例は `Async agent launched successfully.`、`[SYSTEM NOTIFICATION - NOT USER INPUT]`、`Concurrent subagent limit reached.`。モデル向け引数説明は参照の文言を維持します。プロンプト内のコアツール名だけ Pi の `read / grep / find / bash / write / edit / ls` に置き換えます。ship-readiness の起動例と、待機中に結果を捏造しない例も含めています。
+
+### Pi への適応と検証上の限界
+
+- 同時実行上限は環境変数ではなく `ccSubagent.maxConcurrent`。前景・背景・再開の共通レジストリで予約し、writer の独自上限は廃止しました。
+- 通知 XML は `pi.sendMessage()` の custom message として followUp / triggerTurn で配送し、TUI は `renderRuns` で表示します。CC 内部のメタ user メッセージ実装そのものではありません。
+- Context は Pi の `systemPromptOptions.contextFiles`。CC 独自の CLAUDE.md 探索は追加しません。32 KiB の whole-file cap と currentDate を保持し、Explore / Plan は claudeMd を省略します。
+- Explore / Plan に bash は残します。親の権限フックを通しますが、read-only の安全性はプロンプトと Pi の権限設定に依存します。子のツールには再委任用3ツールと ask_user 系を公開しません。
+- provider をまたぐモデルの別名解決と Pi ThinkingLevel への変換、初回ゼロ出力拒否時の親プロンプト付き1回再試行は Pi 用です。fileLocks は既定ONの追加安全策であり、CC の機能の再現ではありません。
+- 予算制御・結果ファイルは既定OFF。有効時は以前の Pi 用制約を使います。結果・通知には100,000文字上限があります。
+- 再開履歴はセッション内メモリのみ。永続再開、team、remote / worktree 分離、子から main への SendMessage は実装対象外です。
+- 兄弟 Agent 呼び出しを Pi の1ツリーに統合する API がないため別々の行です。旧ツリー表示はデモ用に残し、実行用の tasks 配列は廃止しました。
+
+モックテストでスキーマ・結果文字列・通知・実行枠・停止重複・キュー／再開・カスタム定義・モデル／effort・設定と UI の回帰を検証しています。実 API、claude-bridge 実機、今回のフローの PTY 操作、CC 本体との同時比較は未検証です。以下の2.1.19 / 2.1.63 は**表示実装の歴史的な調査記録**です。旧 tasks 配列や旧上限についての記述は現在の動作を表しません。現行の動作は README とこの2.1.322節を優先してください。
+
+## 一次資料（旧表示実装：2.1.19）
 
 - 公式 npm パッケージ：`@anthropic-ai/claude-code@2.1.19`
 - 取得元：<https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.19.tgz>

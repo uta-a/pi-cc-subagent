@@ -1,511 +1,286 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { AssistantMessage, Usage, Message, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import fs from "node:fs";
 import os from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, ExtensionToolContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
-import extension from "../src/index.ts";
-import { emptyUsage, type Details, type Task } from "../src/state.ts";
-import { MAX_BACKGROUND_AGENTS, RESULT_MESSAGE_TYPE } from "../src/background.ts";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import { capacityError, RESULT_MESSAGE_TYPE } from "../src/background.ts";
+import { emptyUsage, type Details } from "../src/state.ts";
+import { harness, response, flush } from "./helpers.ts";
 
-interface Params extends Partial<Task> { tasks?: Task[]; run_in_background?: boolean }
-interface Result { content: { type: "text"; text: string }[]; details: Details; usage?: Usage; isError?: boolean }
-type Execute = (id: string, params: Params, signal: AbortSignal | undefined, update: (() => void) | undefined, ctx: ExtensionToolContext) => Promise<Result>;
-type MessageRenderer = Parameters<ExtensionAPI["registerMessageRenderer"]>[1];
-const task: Task = { description: "Find code", prompt: "Find code", subagent_type: "Explore" };
-const flush = () => new Promise<void>(resolve => setImmediate(resolve));
-function response(text = "Done"): AssistantMessage {
-  return { role: "assistant", content: [{ type: "text", text }], api: "anthropic-messages", provider: "test", model: "test", usage: { ...emptyUsage(), input: 100, output: 10, totalTokens: 110 }, stopReason: "stop", timestamp: Date.now() };
-}
-function harness() {
-  const events = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
-  const commands = new Map<string, (args: string, ctx: ExtensionCommandContext) => Promise<void>>();
-  const renderers = new Map<string, MessageRenderer>();
-  const sent: { message: Parameters<ExtensionAPI["sendMessage"]>[0]; options: Parameters<ExtensionAPI["sendMessage"]>[1] }[] = [];
-  const writes: (string | undefined)[] = [], notices: string[] = [];
-  const pending: { resolve: (value: AssistantMessage) => void; signal: AbortSignal }[] = [];
-  const nested: { name: string; signal?: AbortSignal }[] = [];
-  const conversations: Message[][] = [];
-  const choices: SimpleStreamOptions[] = [];
-  const theme = { style: (text: string) => text, fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
-  let editorFactory = () => ({ getText: () => "", handleInput(_key: string) {} });
-  let tool!: { execute: Execute; renderResult: (result: Result, options: { expanded: boolean }, theme: Theme, context: { keyHint: () => string }) => Component };
-  const pi = {
-    on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { events.set(name, handler); },
-    registerTool(definition: unknown) { tool = definition as typeof tool; },
-    registerCommand(name: string, definition: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) { commands.set(name, definition.handler); },
-    registerEntryRenderer() {},
-    registerMessageRenderer(name: string, renderer: MessageRenderer) { renderers.set(name, renderer); },
-    sendMessage(message: Parameters<ExtensionAPI["sendMessage"]>[0], options: Parameters<ExtensionAPI["sendMessage"]>[1]) { sent.push({ message, options }); },
-  } as unknown as ExtensionAPI;
-  const ctx = {
-    mode: "tui", cwd: "/tmp", model: { provider: "test", id: "test" }, tools: ["read", "write", "edit"].map(name => ({ name, description: name, parameters: {} })),
-    isIdle: () => true, getSystemPrompt: () => "test",
-    ui: { theme, getEditorComponent: () => editorFactory,
-      setEditorComponent(factory: typeof editorFactory) { editorFactory = factory; },
-      setStatus(_key: string, text: string | undefined) { writes.push(text); },
-      notify(text: string) { notices.push(text); } },
-    modelRegistry: { streamSimple(_model: unknown, context: { messages: Message[] }, options: SimpleStreamOptions & { signal: AbortSignal }) {
-      conversations.push(structuredClone(context.messages));
-      choices.push(options);
-      let resolve!: (value: AssistantMessage) => void;
-      const result = new Promise<AssistantMessage>(r => { resolve = r; });
-      pending.push({ resolve, signal: options.signal });
-      return { async *[Symbol.asyncIterator]() {}, result: () => result };
-    } },
-    executeTool: async (name: string, _args: unknown, options: { signal?: AbortSignal }) => {
-      nested.push({ name, signal: options.signal });
-      return { isError: false, result: { content: [{ type: "text", text: "contents" }], details: {} } };
-    },
-  } as unknown as ExtensionToolContext & ExtensionCommandContext;
-  extension(pi);
-  return { ctx, theme, events, commands, renderers, sent, writes, notices, pending, nested, conversations, choices,
-    execute: (params: Params, signal?: AbortSignal, update?: () => void) => tool.execute("id", params, signal, update, ctx),
-    receipt: (result: Result) => tool.renderResult(result, { expanded: false }, theme, { keyHint: () => "ctrl+o to expand" }).render(200).join("\n"),
-    shutdown: () => events.get("session_shutdown")!({}, ctx),
-  };
-}
+const idOf = (result: { details?: Details }) => result.details!.runs[0].id;
+const textOf = (h: ReturnType<typeof harness>, index = 0) => String(h.sent[index].message.content);
 
-test("background returns before responses, freezes a launch receipt and sends one followUp with all results", async () => {
-  const h = harness(); let updates = 0;
-  const result = await h.execute({ run_in_background: true, tasks: [
-    { ...task, name: "researcher" }, { ...task, description: "Design", subagent_type: "Plan" },
-  ] }, undefined, () => { updates++; });
-  assert.equal(h.pending.length, 2);
-  assert.equal(h.sent.length, 0);
-  assert.equal(result.usage, undefined);
-  assert.match(result.content[0].text, /researcher: Find code/);
-  assert.match(result.content[0].text, /Plan: Design/);
-  assert.match(result.content[0].text, /delivered later as a message/);
-  assert.deepEqual(result.details.runs.map(run => run.status), ["running", "running"]);
-  assert.match(h.writes.at(-1)!, /researcher/);
-  assert.doesNotMatch(h.receipt(result), /Running|Initializing|Queued/);
-  h.pending[1].resolve(response("Design answer")); await flush();
-  assert.equal(h.sent.length, 0);
+test("background is default; each call has a cryptographic ID, frozen receipt and one followUp", async () => {
+  const h = harness();
+  const a = await h.agent({ name: "researcher" }), b = await h.agent({ subagent_type: "Plan" });
+  assert.match(idOf(a), /^a[0-9a-f]{16}$/); assert.notEqual(idOf(a), idOf(b));
+  assert.equal(h.pending.length, 2); assert.equal(a.usage, undefined);
+  assert.equal(a.content[0].text, `Async agent launched successfully. (This tool result is internal metadata — never quote or paste any part of it, including the agentId below, into a user-facing reply.)\nagentId: ${idOf(a)} (internal ID - do not mention to user. Use SendMessage with to: '${idOf(a)}', summary: '<5-10 word recap>' to continue this agent.)\nThe agent is working in the background. You will be notified automatically when it completes. You know nothing about its results until that notification arrives — do not report, assume, or predict them; continue other work or respond to the user in the meantime.\nIn your own words, briefly tell the user what you launched — do not echo this tool result. Agent results will arrive in a subsequent message. If the user asks for progress, say the agent is still running.`);
+  h.pending[1].resolve(response("Plan answer")); await flush();
+  assert.equal(h.sent.length, 1); assert.match(textOf(h), /<result>Plan answer<\/result>/);
   h.pending[0].resolve(response("Code answer")); await flush();
-  assert.equal(h.sent.length, 1);
-  const { message, options } = h.sent[0];
-  assert.equal(message.customType, RESULT_MESSAGE_TYPE);
-  assert.equal(message.display, true);
-  assert.deepEqual(options, { deliverAs: "followUp", triggerTurn: true });
-  assert.equal(message.content, "## Find code [completed]\nCode answer\n\n## Design [completed]\nDesign answer");
-  assert.equal((message.details as Details).runs[0].usage.totalTokens, 110);
-  assert.equal(result.details.runs[0].status, "running"); // receipt cannot mutate after returning
-  assert.equal(updates, 0); // no tool-result callbacks after returning
-  assert.equal(h.writes.at(-1), undefined);
+  assert.equal(h.sent.length, 2); assert.equal(a.details!.runs[0].status, "running");
+  assert.deepEqual(h.sent[0].options, { deliverAs: "followUp", triggerTurn: true });
+  assert.equal(h.sent[0].message.customType, RESULT_MESSAGE_TYPE); assert.equal(h.sent[0].message.display, true);
+  assert.match(textOf(h), /^<system-reminder>\n\[SYSTEM NOTIFICATION - NOT USER INPUT\]/);
+  assert.match(textOf(h), /<status>completed<\/status>\n<summary>Agent "Find code" finished<\/summary>/);
+  assert.match(textOf(h), /<subagent_tokens>110<\/subagent_tokens>/); assert.equal(h.writes.at(-1), undefined);
   h.shutdown();
 });
 
-test("read-only calls run in the background by default", async () => {
-  const h = harness();
-  const single = await h.execute({ ...task });
-  assert.match(single.content[0].text, /^Launched background agents:/);
-  const parallel = await h.execute({ tasks: [task, { ...task, subagent_type: "Plan" }] });
-  assert.match(parallel.content[0].text, /^Launched background agents:/);
-  assert.equal(h.pending.length, 3);
-  for (const pending of h.pending) pending.resolve(response());
-  await flush();
-  assert.equal(h.sent.length, 2);
-  h.shutdown();
+test("false waits and foreground formats include usage except Explore/Plan", async () => {
+  for (const type of ["general-purpose", "Explore", "Plan"]) {
+    const h = harness(); let settled = false;
+    const call = h.agent({ subagent_type: type, run_in_background: false }).then(result => { settled = true; return result; });
+    await flush(); assert.equal(settled, false);
+    h.pending[0].resolve(response("answer")); const result = await call;
+    if (type !== "general-purpose") assert.equal(result.content[0].text, "answer");
+    else assert.match(result.content[0].text, new RegExp(`^answer\\nagentId: ${idOf(result)} .*\\n<usage>subagent_tokens: 110\\ntool_uses: 0\\nduration_ms: \\d+</usage>$`));
+    assert.equal(result.usage!.totalTokens, 110); assert.equal(h.sent.length, 0); h.shutdown();
+  }
 });
-test("explicit false always waits; full total capacity makes implicit calls wait", async () => {
-  for (const params of [
-    { ...task, run_in_background: false },
-    { ...task, subagent_type: "general-purpose" as const, run_in_background: false },
-  ]) {
-    const h = harness();
-    let settled = false;
-    const call = h.execute(params).then(result => { settled = true; return result; });
-    await flush();
-    assert.equal(settled, false, JSON.stringify(params)); // waits for children
-    for (const pending of h.pending) pending.resolve(response("answer"));
+test("empty output completes with CC placeholder; foreground errors retain partial text", async () => {
+  for (const failed of [false, true]) {
+    const h = harness(); const call = h.agent({ run_in_background: false });
+    h.pending[0].resolve(failed ? { ...response("partial"), stopReason: "error", errorMessage: "Unavailable" } : response(""));
     const result = await call;
-    assert.match(result.content[0].text, /\[completed\]\nanswer/);
-    assert.equal(h.sent.length, 0);
-    h.shutdown();
+    assert.match(result.content[0].text, failed ? /^Unavailable\n\npartial$/ : /^\(Subagent completed but returned no output\.\)\nagentId:/);
+    assert.equal(result.isError, failed); h.shutdown();
   }
-  const h = harness();
-  await h.execute({ tasks: Array.from({ length: MAX_BACKGROUND_AGENTS }, () => task) });
-  let settled = false;
-  const overflow = h.execute({ ...task }).then(result => { settled = true; return result; });
-  await flush();
-  assert.equal(settled, false); // capacity full: implicit default falls back to waiting instead of failing
-  for (const pending of h.pending) pending.resolve(response("answer"));
-  assert.match((await overflow).content[0].text, /\[completed\]/);
-  await flush();
-  assert.equal(h.sent.length, 1);
-  h.shutdown();
 });
-test("writers and unspecified types launch in the background by default and explicit true", async () => {
-  for (const subagent_type of ["general-purpose", undefined] as const) {
-    for (const run_in_background of [undefined, true]) {
-      const h = harness();
-      const result = await h.execute({ tasks: [task, { ...task, subagent_type }], run_in_background });
-      assert.equal(result.details.background, true);
-      assert.equal(h.pending.length, 2);
-      for (const child of h.pending) child.resolve(response());
-      await flush();
-      assert.equal(h.sent.length, 1);
-      h.shutdown();
-    }
-  }
+test("background resume cannot mutate the original foreground usage receipt", async () => {
+  const h = harness(); const call = h.agent({ run_in_background: false }); h.pending[0].resolve(response()); const result = await call;
+  await h.call("SendMessage", { to: idOf(result), message: "continue" }); h.pending[1].resolve(response()); await flush();
+  assert.equal(result.usage!.totalTokens, 110); assert.equal((h.sent[0].message.details as Details).runs[0].usage.totalTokens, 220); h.shutdown();
 });
 
-test("parent abort is isolated; named stop and stop-all interrupt children and release status", async () => {
-  const h = harness(), parent = new AbortController();
-  await h.execute({ ...task, run_in_background: true }, parent.signal);
-  await h.execute({ ...task, run_in_background: true }, parent.signal);
-  parent.abort();
-  assert.ok(h.pending.every(child => !child.signal.aborted && child.signal !== parent.signal));
-  const stop = h.commands.get("cc-agents-stop")!;
-  await stop("missing", h.ctx); assert.match(h.notices.at(-1)!, /No matching/);
-  await stop("Explore-2", h.ctx);
-  assert.equal(h.pending[0].signal.aborted, false);
-  assert.equal(h.pending[1].signal.aborted, true);
+test("cap 20 counts simultaneous foreground/background calls without writer cap or foreground fallback", async () => {
+  const h = harness();
+  const foreground = h.agent({ run_in_background: false });
+  const launches = await Promise.all(Array.from({ length: 19 }, () => h.agent()));
+  assert.equal(h.pending.length, 20);
+  await assert.rejects(h.agent(), { message: capacityError(20) });
+  await assert.rejects(h.agent({ run_in_background: false }), { message: capacityError(20) });
+  h.pending[0].resolve(response()); await foreground;
+  await h.agent(); assert.equal(h.pending.length, 21);
+  assert.equal(new Set(launches.map(idOf)).size, 19);
+  for (const pending of h.pending) pending.resolve(response()); await flush(); h.shutdown();
+});
+test("setting cap counts resumed agents too and rejects before appending a resume message", async () => {
+  const h = harness(); h.config({ maxConcurrent: 1 });
+  const first = await h.agent(); h.pending[0].resolve(response()); await flush();
+  const second = await h.agent();
+  await assert.rejects(h.call("SendMessage", { to: idOf(first), message: "blocked" }), { message: capacityError(1) });
   h.pending[1].resolve(response()); await flush();
-  assert.match(String(h.sent[0].message.content), /\[aborted\]\nInterrupted/);
-  assert.match(h.writes.at(-1)!, /Explore  Find code/);
-  assert.doesNotMatch(h.writes.at(-1)!, /Explore-2/);
-  await stop("", h.ctx);
-  assert.equal(h.pending[0].signal.aborted, true);
-  h.pending[0].resolve(response()); await flush();
-  assert.equal(h.writes.at(-1), undefined);
-  assert.match(String(h.sent[1].message.content), /Interrupted/);
-  h.shutdown();
+  await h.call("SendMessage", { to: idOf(first), message: "resume" });
+  await assert.rejects(h.agent(), { message: capacityError(1) });
+  assert.doesNotMatch(JSON.stringify(h.conversations[2]), /blocked/);
+  h.pending[2].resolve(response()); await flush(); assert.notEqual(idOf(first), idOf(second)); h.shutdown();
+});
+test("SendMessage queues user messages after the current tool round, before the next request", async () => {
+  const h = harness(); const launched = await h.agent({ name: "worker" });
+  const sent = await h.call("SendMessage", { to: "worker", message: "course correction" });
+  assert.deepEqual(JSON.parse(sent.content[0].text), { success: true, message: 'Agent "worker" is already running; queued your message for its next turn.' });
+  h.pending[0].resolve(response("", "read")); await flush();
+  assert.equal(h.nested.length, 1);
+  assert.equal(h.conversations[1].at(-2)!.role, "toolResult");
+  assert.deepEqual(h.conversations[1].at(-1), { role: "user", content: "course correction", timestamp: h.conversations[1].at(-1)!.timestamp });
+  h.pending[1].resolve(response("fixed")); await flush();
+  assert.match(textOf(h), new RegExp(`<task-id>${idOf(launched)}</task-id>`)); h.shutdown();
+});
+test("queued messages are not lost when the current model response has no tools", async () => {
+  const h = harness(); const launch = await h.agent();
+  await h.call("SendMessage", { to: idOf(launch), message: "one more thing" });
+  h.pending[0].resolve(response()); await flush(); assert.equal(h.pending.length, 2); assert.equal(h.sent.length, 0);
+  h.pending[1].resolve(response()); await flush(); assert.equal(h.sent.length, 1); h.shutdown();
+});
+test("SendMessage resumes completed/failed/stopped transcripts with same ID and a new notification", async () => {
+  for (const state of ["completed", "failed", "killed"]) {
+    const h = harness(); const launch = await h.agent({ name: "worker" });
+    if (state === "killed") await h.call("TaskStop", { task_id: "worker" });
+    h.pending[0].resolve(state === "failed" ? { ...response("partial"), stopReason: "error", errorMessage: "Error" } : response("previous answer")); await flush();
+    const result = await h.call("SendMessage", { to: "worker", message: "continue", summary: "recap" });
+    assert.deepEqual(JSON.parse(result.content[0].text), { success: true, message: 'Agent "worker" resumed in the background; you will be notified when it completes.' });
+    assert.equal(h.conversations[1].at(-1)!.role, "user"); assert.equal(h.conversations[1].at(-1)!.content, "continue");
+    assert.ok(h.conversations[1].length >= h.conversations[0].length + 1);
+    if (state === "completed") assert.match(JSON.stringify(h.conversations[1]), /previous answer/);
+    h.pending[1].resolve(response("new answer")); await flush(); assert.equal(h.sent.length, 2);
+    assert.match(textOf(h, 1), new RegExp(`<task-id>${idOf(launch)}</task-id>`));
+    assert.equal((h.sent[1].message.details as Details).runs[0].id, idOf(launch)); h.shutdown();
+  }
+});
+test("names resolve latest-wins, while raw IDs still address the older agent", async () => {
+  const h = harness(); const a = await h.agent({ name: "same" }), b = await h.agent({ name: "same" });
+  await h.call("SendMessage", { to: "same", message: "newest" });
+  await h.call("SendMessage", { to: idOf(a), message: "oldest" });
+  for (const pending of h.pending.slice()) pending.resolve(response("", "read")); await flush();
+  assert.equal(h.conversations[2].at(-1)!.content, "oldest"); assert.equal(h.conversations[3].at(-1)!.content, "newest");
+  assert.notEqual(idOf(a), idOf(b));
+  for (const pending of h.pending) pending.resolve(response()); await flush(); h.shutdown();
+});
+test("SendMessage unknown and broadcast errors are exact", async () => {
+  const h = harness();
+  await assert.rejects(h.call("SendMessage", { to: "missing", message: "x" }), { message: 'Agent "missing" not found' });
+  await assert.rejects(h.call("SendMessage", { to: "*", message: "x" }), { message: 'broadcast (to: "*") is no longer supported — send a message per recipient' }); h.shutdown();
+});
+test("TaskStop by ID/name/shell alias returns JSON and exactly one killed notification", async () => {
+  for (const mode of ["id", "name", "shell"]) {
+    const h = harness(); const launch = await h.agent({ name: "worker" });
+    const result = await h.call("TaskStop", mode === "shell" ? { shell_id: idOf(launch) } : { task_id: mode === "id" ? idOf(launch) : "worker" });
+    assert.deepEqual(JSON.parse(result.content[0].text), { message: `Successfully stopped task: ${idOf(launch)} (Find code)`, task_id: idOf(launch), task_type: "local_agent", command: "Find code" });
+    assert.equal(h.pending[0].signal.aborted, true);
+    h.pending[0].resolve(response()); await flush(); await flush(); assert.equal(h.sent.length, 1);
+    assert.match(textOf(h), /<status>killed<\/status>\n<summary>Agent "Find code" was stopped<\/summary>/);
+    await assert.rejects(h.call("TaskStop", { task_id: "worker" }), { message: "Task worker is not running (status: killed)" }); h.shutdown();
+  }
+});
+test("TaskStop missing/not found/not running errors; commands stop by display label or all", async () => {
+  const h = harness();
+  await assert.rejects(h.call("TaskStop", {}), { message: "Missing required parameter: task_id" });
+  await assert.rejects(h.call("TaskStop", { task_id: "missing" }), /not found/);
+  const first = await h.agent({ subagent_type: "Explore" }); await h.agent({ subagent_type: "Explore" });
+  await h.commands.get("cc-agents-stop")!("Explore-2", h.ctx); assert.equal(h.pending[1].signal.aborted, true);
+  await h.commands.get("cc-agents-stop")!("", h.ctx); assert.equal(h.pending[0].signal.aborted, true);
+  for (const p of h.pending) p.resolve(response()); await flush(); assert.equal(h.sent.length, 2);
+  const third = await h.agent(); h.pending[2].resolve(response()); await flush();
+  await assert.rejects(h.call("TaskStop", { task_id: idOf(third) }), { message: `Task ${idOf(third)} is not running (status: completed)` });
+  assert.match(textOf(h), new RegExp(idOf(first))); h.shutdown();
+});
+test("background parent cancellation is isolated; foreground cancellation propagates", async () => {
+  const h = harness(), parent = new AbortController();
+  await h.agent({}, parent.signal);
+  const foreground = h.agent({ run_in_background: false }, parent.signal);
+  parent.abort(); assert.equal(h.pending[0].signal.aborted, false); assert.equal(h.pending[1].signal.aborted, true);
+  h.pending[1].resolve(response()); assert.equal((await foreground).isError, true);
+  h.pending[0].resolve(response()); await flush(); assert.equal(h.sent.length, 1); h.shutdown();
+});
+test("shutdown aborts work, clears registry and suppresses late notifications and UI callbacks", async () => {
+  const h = harness(); await h.agent(); h.shutdown(); h.shutdown();
+  const writes = h.writes.length;
+  assert.equal(h.pending[0].signal.aborted, true); h.pending[0].resolve(response()); await flush();
+  assert.equal(h.sent.length, 0); assert.equal(h.writes.length, writes);
+  await assert.rejects(h.agent(), /shut down/);
+});
+test("failed XML, verbatim results and 100000-character caps preserve metadata", async () => {
+  const h = harness(); await h.agent();
+  h.pending[0].resolve({ ...response("<partial>&"), stopReason: "error", errorMessage: "Unavailable" }); await flush();
+  assert.match(textOf(h), /<status>failed<\/status>\n<summary>Agent "Find code" failed: Unavailable<\/summary>/);
+  assert.match(textOf(h), /<result><partial>&<\/result>/);
+  await h.agent(); h.pending[1].resolve(response("x".repeat(120000))); await flush();
+  assert.ok(textOf(h, 1).length <= 100000); assert.match(textOf(h, 1), /<\/system-reminder>$/);
+  const call = h.agent({ run_in_background: false }); h.pending[2].resolve(response("x".repeat(120000)));
+  const result = await call; assert.equal(result.content[0].text.length, 100000); assert.match(result.content[0].text, /agentId:.*\n<usage>/); h.shutdown();
+});
+test("XML truncation keeps closing tags intact", async () => {
+  const h = harness(); await h.agent(); h.pending[0].resolve(response("<&>".repeat(50000))); await flush();
+  const text = textOf(h); assert.ok(text.length <= 100000); assert.match(text, /\[Output truncated\]<\/result>/);
+  assert.match(text, /<\/result>\n<usage>/); assert.match(text, /<\/system-reminder>$/); h.shutdown();
+});
+test("resume re-reads budget settings without changing its original model or effort", async () => {
+  const h = harness(); const launch = await h.agent(); h.pending[0].resolve(response()); await flush();
+  h.config({ budgets: "quick" }); await h.call("SendMessage", { to: idOf(launch), message: "continue" });
+  assert.equal(h.choices[1].maxTokens, 2048); assert.equal(h.models[1], h.models[0]);
+  h.pending[1].resolve(response()); await flush();
+  h.config({ budgets: "off" }); await h.call("SendMessage", { to: idOf(launch), message: "continue again" });
+  assert.equal("maxTokens" in h.choices[2], false); h.pending[2].resolve(response()); await flush(); h.shutdown();
 });
 
-test("already aborted parent signals do not prevent background launch", async () => {
-  const h = harness();
-  await h.execute({ ...task, run_in_background: true }, AbortSignal.abort());
-  assert.equal(h.pending[0].signal.aborted, false);
-  h.pending[0].resolve(response()); await flush();
-  assert.equal(h.sent.length, 1);
-  h.shutdown();
-});
-
-test("session shutdown aborts background work, clears timers and suppresses late messages/status", async t => {
-  t.mock.timers.enable({ apis: ["setInterval"] });
-  const h = harness();
-  await h.execute({ run_in_background: true, tasks: [task, task] });
-  h.shutdown(); h.shutdown();
-  assert.ok(h.pending.every(child => child.signal.aborted));
-  assert.equal(h.writes.at(-1), undefined);
-  const count = h.writes.length;
-  t.mock.timers.tick(5000);
-  for (const child of h.pending) child.resolve(response());
-  await flush();
-  assert.equal(h.writes.length, count);
-  assert.equal(h.sent.length, 0);
-  await assert.rejects(h.execute({ ...task, run_in_background: true }), /shut down/);
-});
-
-test("global background cap rejects atomically across calls and frees slots only when settled", async () => {
-  const h = harness();
-  await assert.rejects(h.execute({ run_in_background: true, tasks: Array.from({ length: MAX_BACKGROUND_AGENTS + 1 }, () => task) }), /capacity exceeded/);
-  assert.equal(h.pending.length, 0);
-  await h.execute({ run_in_background: true, tasks: [task, task, task] });
-  await assert.rejects(h.execute({ run_in_background: true, tasks: [task, task] }), /Nothing started/);
-  assert.equal(h.pending.length, 3);
-  await h.execute({ ...task, run_in_background: true });
-  assert.equal(h.pending.length, MAX_BACKGROUND_AGENTS);
-  await h.commands.get("cc-agents-stop")!("Explore-4", h.ctx);
-  await assert.rejects(h.execute({ ...task, run_in_background: true }), /capacity exceeded/);
-  h.pending[3].resolve(response()); await flush();
-  await h.execute({ ...task, run_in_background: true });
-  assert.equal(h.pending.length, MAX_BACKGROUND_AGENTS + 1);
-  for (const child of h.pending) child.resolve(response());
-  await flush();
-  assert.equal(h.sent.length, 3);
-  assert.equal(h.writes.at(-1), undefined);
-  h.shutdown();
-});
-
-test("completion message renderer reuses collapsed Done rows and the tools-expand key", async () => {
-  const h = harness();
-  assert.ok(h.renderers.has(RESULT_MESSAGE_TYPE));
-  await h.execute({ ...task, run_in_background: true });
+test("message renderer uses Done/Prompt/Response, never raw XML; launch renderer is a receipt", async () => {
+  const h = harness(); const launch = await h.agent({ name: "worker" });
+  const rendered = h.tools.get("Agent")!.renderResult(launch, { expanded: false }, h.theme, { keyHint: () => "" }).render(200).join("\n");
+  assert.match(rendered, /Agent launched: worker/); assert.doesNotMatch(rendered, /Running|agentId/);
   h.pending[0].resolve(response("Final answer")); await flush();
   const renderer = h.renderers.get(RESULT_MESSAGE_TYPE)!;
   const message = { ...h.sent[0].message, role: "custom" as const, timestamp: Date.now() };
-  const hint = (id: string, label: string) => { assert.equal(id, "app.tools.expand"); return `custom-key ${label}`; };
-  const render = (expanded: boolean) => renderer(message, { expanded, outputPad: 0, keyHint: hint, keyText: () => "custom-key" }, h.theme)!.render(200).join("\n");
-  assert.match(render(false), /Done \(0 tool uses · 110 tokens/);
-  assert.match(render(false), /custom-key to expand/);
-  assert.doesNotMatch(render(false), /Final answer/);
-  assert.match(render(true), /Prompt:/);
-  assert.match(render(true), /Final answer/);
-  h.shutdown();
+  const view = (expanded: boolean) => renderer(message, { expanded, outputPad: 0, keyHint: () => "custom-key to expand", keyText: () => "custom-key" }, h.theme)!.render(200).join("\n");
+  assert.match(view(false), /Done \(0 tool uses · 110 tokens/); assert.doesNotMatch(view(false), /task-notification|Final answer/);
+  assert.match(view(true), /Final answer/); assert.match(view(true), /Prompt:/); h.shutdown();
 });
-
-test("background preview remains available after return and shows final output when the child finishes", async () => {
-  const h = harness();
-  let preview!: Component & { handleInput(key: string): void; dispose(): void };
+test("live background preview survives receipt and shows final status", async () => {
+  const h = harness(); let preview!: Component & { handleInput(key: string): void; dispose(): void };
   h.ctx.ui.custom = ((factory: (tui: unknown, theme: Theme, keys: unknown, done: () => void) => typeof preview) => new Promise<void>(resolve => {
     preview = factory({ terminal: { rows: 40 }, requestRender() {} }, h.theme, { matches: () => false }, () => { preview.dispose(); resolve(); });
   })) as typeof h.ctx.ui.custom;
-  await h.execute({ ...task, name: "researcher", run_in_background: true });
-  const open = h.commands.get("cc-agents")!("", h.ctx);
-  const text = () => preview.render(200).join("\n");
-  assert.match(text(), /researcher — live activity/);
-  assert.match(text(), /Status: running/);
+  await h.agent({ name: "researcher" }); const open = h.commands.get("cc-agents")!("", h.ctx);
+  assert.match(preview.render(200).join("\n"), /researcher — live activity/);
   h.pending[0].resolve(response("Final findings")); await flush();
-  assert.equal(h.writes.at(-1), undefined);
-  assert.match(text(), /Status: completed/);
-  assert.match(text(), /Usage: 110 cumulative tokens/);
-  assert.match(text(), /Final findings/);
-  preview.handleInput("\r"); await open;
-  h.shutdown();
+  assert.match(preview.render(200).join("\n"), /Status: completed/); assert.match(preview.render(200).join("\n"), /Final findings/);
+  preview.handleInput("\r"); await open; h.shutdown();
 });
-
-test("background completion saves full output, returns a head/path and caps UI details", async t => {
+test("result files are opt-in in foreground/background, restrictive and removed at shutdown", async t => {
   const dir = fs.mkdtempSync(join(process.cwd(), ".test-results-"));
-  t.mock.method(os, "tmpdir", () => dir);
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const h = harness();
-  await h.execute({ run_in_background: true, tasks: [task, task] });
-  for (const child of h.pending) child.resolve(response("日".repeat(30000)));
-  await flush();
-  const { content, details } = h.sent[0].message;
-  assert.equal(typeof content, "string");
-  assert.ok(Buffer.byteLength(content as string) <= 48 * 1024 + 30);
-  assert.match(content as string, /Full result \(88 KiB\) saved to:/);
-  assert.ok(Buffer.byteLength(content as string) < 6 * 1024);
-  const paths = [...(content as string).matchAll(/saved to: (.+) —/g)].map(match => match[1]);
-  assert.equal(paths.length, 2);
-  for (const path of paths) assert.equal(fs.readFileSync(path, "utf8"), "日".repeat(30000));
-  assert.ok((details as Details).runs.every(run => run.output.endsWith("[Output truncated]") && !run.output.includes("�")));
-  h.shutdown();
-  for (const path of paths) assert.equal(fs.existsSync(path), false);
+  t.mock.method(os, "tmpdir", () => dir); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const resultFiles of [false, true]) for (const background of [false, true]) {
+    const h = harness(); h.config({ resultFiles });
+    const call = h.agent({ run_in_background: background }); h.pending[0].resolve(response("HEAD" + "x".repeat(60000)));
+    const result = await call; await flush(); const text = background ? textOf(h) : result.content[0].text;
+    if (resultFiles) {
+      const path = text.match(/saved to: (.+) —/)![1]; assert.equal(fs.readFileSync(path, "utf8").length, 60004);
+      assert.equal(fs.statSync(path).mode & 0o777, 0o600); assert.equal(fs.statSync(join(dir, "pi-cc-subagent")).mode & 0o777, 0o700);
+      h.shutdown(); assert.equal(fs.existsSync(path), false);
+    } else { assert.doesNotMatch(text, /saved to:/); assert.ok(text.length > 60000); h.shutdown(); }
+  }
+});
+test("result-file failure falls back inline without losing the error", async t => {
+  const dir = fs.mkdtempSync(join(process.cwd(), ".test-results-")); t.mock.method(os, "tmpdir", () => dir);
+  t.mock.method(fs, "writeFileSync", () => { throw new Error("Disk full"); }); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const h = harness(); h.config({ resultFiles: true }); const call = h.agent({ run_in_background: false });
+  h.pending[0].resolve({ ...response("x".repeat(60000)), stopReason: "error", errorMessage: "Error" });
+  const result = await call; assert.match(result.content[0].text, /^Error/); assert.match(result.content[0].text, /Output truncated/); assert.doesNotMatch(result.content[0].text, /saved to:/); h.shutdown();
+});
+test("fileLocks default on, configurable off; foreground remains outside background locks", async () => {
+  for (const fileLocks of [undefined, false]) {
+    const h = harness(); h.config({ fileLocks }); await h.agent({ name: "writer" });
+    h.pending[0].resolve(response("", "write")); await flush();
+    const main = h.events.get("tool_call")!({ toolName: "edit", toolCallId: "main", input: { path: "shared.ts" } }, h.ctx);
+    if (fileLocks === false) assert.equal(main, undefined); else assert.deepEqual(main, { block: true, reason: `${join(process.cwd(), "shared.ts")} is being modified by background agent writer; wait for its result message or stop it with /cc-agents-stop writer.` });
+    h.pending[1].resolve(response()); await flush(); h.shutdown();
+  }
+});
+test("zero-output first-request refusal retries once, later failure does not retry", async () => {
+  const h = harness(); await h.agent(); const rejected = { ...response(""), stopReason: "error" as const, errorMessage: "prompt-capture: no capture", usage: emptyUsage() };
+  h.pending[0].resolve(rejected); await flush();
+  assert.equal(h.pending.length, 2); assert.match(String(h.conversations[1][0].content), /^PARENT SECRET SYSTEM/);
+  h.pending[1].resolve(rejected); await flush(); assert.equal(h.pending.length, 2); assert.match(textOf(h), /failed/); h.shutdown();
 });
 
-test("background nested reads still use executeTool after the parent tool has returned", async () => {
-  const h = harness();
-  await h.execute({ ...task, run_in_background: true });
-  h.pending[0].resolve({ ...response(), stopReason: "toolUse", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "src/index.ts" } }] });
-  await flush();
-  assert.equal(h.nested[0].name, "read");
-  assert.equal(h.nested[0].signal, h.pending[0].signal);
-  assert.equal(h.pending.length, 2);
-  h.pending[1].resolve(response()); await flush();
-  assert.equal((h.sent[0].message.details as Details).runs[0].toolUses, 1);
-  h.shutdown();
-});
-
-test("writer cap is per task, atomic across calls, with implicit foreground fallback", async () => {
-  const h = harness();
-  const writer = { ...task, subagent_type: undefined };
-  await assert.rejects(h.execute({ run_in_background: true, tasks: [writer, writer, writer] }), /2 writable.*Nothing started/);
-  assert.equal(h.pending.length, 0);
-  await h.execute({ tasks: [writer, writer] });
-  await assert.rejects(h.execute({ ...writer, run_in_background: true }), /capacity exceeded/);
-  assert.equal(h.pending.length, 2);
-  // Read-only tasks still fit beside the two writers, up to the total cap.
-  await h.execute({ tasks: [task, task] });
-  await assert.rejects(h.execute({ ...task, run_in_background: true }), /capacity exceeded/);
-  const foreground = h.execute(writer);
-  await flush();
-  assert.equal(h.pending.length, 5);
-  h.pending[4].resolve(response("foreground answer"));
-  assert.equal((await foreground).details.background, undefined);
-  await h.commands.get("cc-agents-stop")!("worker-2", h.ctx);
-  await assert.rejects(h.execute({ ...writer, run_in_background: true }), /capacity exceeded/);
-  h.pending[1].resolve(response()); await flush();
-  assert.equal(h.sent.length, 0); // first group still has one running writer
-  await h.execute({ ...writer, run_in_background: true });
-  assert.equal(h.pending.length, 6);
-  for (const child of h.pending) child.resolve(response());
-  await flush();
-  h.shutdown();
-});
-
-function mutate(name = "edit", path = "@shared.ts"): AssistantMessage {
-  return { ...response(), stopReason: "toolUse", content: [{ type: "toolCall", id: "mutation", name, arguments: { path } }] };
-}
-function mainCall(h: ReturnType<typeof harness>, name = "write", path = "shared.ts", parentToolCallId?: string) {
-  return h.events.get("tool_call")!({ toolName: name, toolCallId: "main-call", input: { path }, parentToolCallId }, h.ctx) as { block: boolean; reason: string } | undefined;
-}
-function mainEnd(h: ReturnType<typeof harness>, isError = false) {
-  h.events.get("tool_execution_end")!({ toolName: "write", toolCallId: "main-call", isError }, h.ctx);
-}
-test("main write/edit blocks only top-level conflicts and releases child locks on every settlement", async () => {
-  for (const status of ["completed", "failed", "aborted"] as const) {
-    const h = harness();
-    await h.execute({ description: "Write", prompt: "Write", name: "writer" });
-    h.pending[0].resolve(mutate()); await flush();
-    assert.equal(h.nested.length, 1);
-    for (const tool of ["write", "edit"]) {
-      assert.deepEqual(mainCall(h, tool), { block: true, reason: "/tmp/shared.ts is being modified by background agent writer; wait for its result message or stop it with /cc-agents-stop writer." });
-      assert.equal(mainCall(h, tool, "/tmp/shared.ts", "parent"), undefined);
-    }
-    assert.equal(mainCall(h, "read"), undefined);
-    if (status === "aborted") await h.commands.get("cc-agents-stop")!("writer", h.ctx);
-    h.pending[1].resolve(status === "failed" ? { ...response(), stopReason: "error", errorMessage: "Failed" } : response());
-    await flush();
-    assert.equal((h.sent[0].message.details as Details).runs[0].status, status);
-    assert.equal(mainCall(h), undefined);
-    h.shutdown();
+test("a foreground result is frozen before its slot can be resumed", async () => {
+  for (let steps = 0; steps < 12; steps++) {
+    const h = harness(); const call = h.agent({ run_in_background: false }); h.pending[0].resolve(response("original answer"));
+    for (let i = 0; i < steps; i++) await Promise.resolve();
+    const result = await call;
+    await h.call("SendMessage", { to: idOf(result), message: "continue" }).catch(() => undefined);
+    assert.match(result.content[0].text, /^original answer\nagentId:/); assert.equal(result.isError, false); h.shutdown();
   }
 });
-test("main reservations protect pending/successful edits but not failed or nested edits", async () => {
-  for (const outcome of ["pending", "success", "failure", "nested"] as const) {
-    const h = harness();
-    await h.execute({ description: "Write", prompt: "Write" });
-    assert.equal(mainCall(h, "edit", "@shared.ts", outcome === "nested" ? "parent" : undefined), undefined);
-    if (outcome === "success" || outcome === "failure") mainEnd(h, outcome === "failure");
-    h.pending[0].resolve(mutate()); await flush();
-    assert.equal(h.nested.length, outcome === "pending" || outcome === "success" ? 0 : 1);
-    if (!h.nested.length) {
-      const text = JSON.stringify(h.conversations[1]);
-      assert.match(text, /locked by main/);
-    }
-    h.pending[1].resolve(response()); await flush();
-    // Main locks expire after the last writer; a new child may edit that path.
-    await h.execute({ description: "Write again", prompt: "Write again" });
-    h.pending[2].resolve(mutate()); await flush();
-    assert.equal(h.nested.length, outcome === "pending" || outcome === "success" ? 1 : 2);
-    h.pending[3].resolve(response()); await flush();
-    h.shutdown();
+test("SendMessage to a stopping agent is refused instead of silently queued", async () => {
+  const h = harness(); const launch = await h.agent();
+  await h.call("TaskStop", { task_id: idOf(launch) });
+  await assert.rejects(h.call("SendMessage", { to: idOf(launch), message: "more" }), /still stopping/);
+  // The mock stream ignores abort; a real provider ends it as aborted.
+  h.pending[0].resolve({ ...response(), stopReason: "aborted" }); await flush(); assert.equal(h.sent.length, 1); assert.match(textOf(h), /<status>killed<\/status>/); h.shutdown();
+});
+test("TaskStop success always matches a killed notification, even right after completion", async () => {
+  for (let steps = 0; steps < 12; steps++) {
+    const h = harness(); const launch = await h.agent(); h.pending[0].resolve(response());
+    for (let i = 0; i < steps; i++) await Promise.resolve();
+    const stopped = await h.call("TaskStop", { task_id: idOf(launch) }).then(() => true, () => false);
+    await flush(); assert.equal(h.sent.length, 1);
+    assert.match(textOf(h), stopped ? /<status>killed<\/status>/ : /<status>completed<\/status>/); h.shutdown();
   }
 });
-test("child locks remain until settlement and do not guard foreground children", async () => {
-  const h = harness();
-  await h.execute({ description: "A", prompt: "A", name: "alpha" });
-  await h.execute({ description: "B", prompt: "B", name: "beta" });
-  h.pending[0].resolve(mutate("write")); await flush();
-  h.pending[1].resolve(mutate()); await flush();
-  assert.equal(h.nested.length, 1);
-  assert.match(JSON.stringify(h.conversations[3]), /background agent alpha/);
-  // Foreground children deliberately do not participate in background locks.
-  const foreground = h.execute({ description: "Foreground", prompt: "Foreground", run_in_background: false });
-  h.pending[4].resolve(mutate()); await flush();
-  assert.equal(h.nested.length, 2);
-  h.pending[5].resolve(response()); await foreground;
-  await h.commands.get("cc-agents-stop")!("alpha", h.ctx);
-  assert.ok(mainCall(h)?.block); // abort requested is not settled yet
-  h.pending[2].resolve(response()); await flush();
-  assert.equal(mainCall(h), undefined);
-  mainEnd(h, true);
-  h.pending[3].resolve(response()); await flush();
-  h.shutdown();
+test("main's nested write/edit (through its own wrapper tools) respects background writer locks", async () => {
+  const h = harness(); await h.agent({ name: "writer" });
+  h.pending[0].resolve(response("", "write")); await flush();
+  const path = join(h.ctx.cwd, "shared.ts");
+  const blocked = h.events.get("tool_call")!({ toolName: "edit", toolCallId: "wrap/1", parentToolCallId: "wrap", input: { path } }, h.ctx) as { block: boolean; reason: string };
+  assert.equal(blocked.block, true); assert.match(blocked.reason, /background agent writer/);
+  h.pending[1].resolve(response()); await flush(); h.shutdown();
 });
-test("shutdown clears locks immediately and late model responses cannot reacquire them", async () => {
-  const h = harness();
-  await h.execute({ description: "Write", prompt: "Write" });
-  h.pending[0].resolve(mutate()); await flush();
-  assert.ok(mainCall(h)?.block);
-  h.shutdown();
-  assert.equal(mainCall(h), undefined);
-  h.pending[1].resolve(mutate()); await flush();
-  assert.equal(h.nested.length, 1);
-  assert.equal(h.sent.length, 0);
-});
-test("extension injects the latest bounded context capture and clears it on capture failure", async () => {
-  const h = harness();
-  const capture = (content: unknown) => h.events.get("before_agent_start")!({ systemPromptOptions: { contextFiles: [{ path: "AGENTS.md", content }] } }, h.ctx);
-  capture("old context"); capture("latest context");
-  await h.execute(task);
-  const system = h.conversations[0][0] as { content: string };
-  assert.match(system.content, /<project_context>.*latest context/s);
-  assert.doesNotMatch(system.content, /old context|^test\n/);
-  capture(null);
-  await h.execute(task);
-  assert.match((h.conversations[1][0] as { content: string }).content, /^test\n/);
-  for (const child of h.pending) child.resolve(response());
-  await flush(); h.shutdown();
-});
-test("foreground large result stores full text with restrictive modes and removes it at shutdown", async t => {
-  const dir = fs.mkdtempSync(join(process.cwd(), ".test-results-"));
-  t.mock.method(os, "tmpdir", () => dir);
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const h = harness();
-  const call = h.execute({ ...task, run_in_background: false });
-  const full = "HEAD:" + "x".repeat(60000) + ":TAIL";
-  h.pending[0].resolve(response(full));
-  const result = await call;
-  const text = result.content[0].text;
-  assert.match(text, /HEAD:/);
-  assert.doesNotMatch(text, /:TAIL/);
-  assert.ok(Buffer.byteLength(text) < 3 * 1024);
-  const path = text.match(/saved to: (.+) —/)![1];
-  assert.equal(fs.readFileSync(path, "utf8"), full);
-  assert.equal(fs.statSync(path).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(join(dir, "pi-cc-subagent")).mode & 0o777, 0o700);
-  assert.match(result.details.runs[0].output, /Output truncated/);
-  h.shutdown();
-  assert.equal(fs.existsSync(path), false);
-});
-test("result-file write failure falls back to capped inline text in both delivery modes", async t => {
-  const dir = fs.mkdtempSync(join(process.cwd(), ".test-results-"));
-  t.mock.method(os, "tmpdir", () => dir);
-  t.mock.method(fs, "writeFileSync", () => { throw new Error("Disk full"); });
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  for (const run_in_background of [false, true]) {
-    const h = harness();
-    const call = h.execute({ ...task, run_in_background });
-    h.pending[0].resolve(response("x".repeat(60000)));
-    const result = await call; await flush();
-    const text = run_in_background ? String(h.sent[0].message.content) : result.content[0].text;
-    assert.match(text, /Output truncated/);
-    assert.doesNotMatch(text, /saved to:/);
-    h.shutdown();
-  }
-});
-test("large budget partial reports save the error and full report in both delivery modes", async t => {
-  const dir = fs.mkdtempSync(join(process.cwd(), ".test-results-"));
-  t.mock.method(os, "tmpdir", () => dir);
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  for (const run_in_background of [false, true]) {
-    const h = harness();
-    const call = h.execute({ ...task, run_in_background });
-    const exhausted = response(); exhausted.usage.output = 4096;
-    h.pending[0].resolve(exhausted); await flush();
-    const partial = "## Findings\n" + "Incomplete evidence\n".repeat(1000);
-    h.pending[1].resolve(response(partial));
-    const result = await call; await flush();
-    const text = run_in_background ? String(h.sent[0].message.content) : result.content[0].text;
-    assert.match(text, /Budget reached/); assert.match(text, /## Findings/);
-    const path = text.match(/saved to: (.+) —/)![1];
-    assert.match(fs.readFileSync(path, "utf8"), /Budget reached.*\n\n## Findings/s);
-    assert.ok(fs.readFileSync(path, "utf8").endsWith(partial));
-    const details = run_in_background ? h.sent[0].message.details as Details : result.details;
-    assert.equal(details.runs[0].output, partial);
-    h.shutdown(); assert.equal(fs.existsSync(path), false);
-  }
-});
-test("foreground and background budget results include both error and partial report", async () => {
-  for (const run_in_background of [false, true]) {
-    const h = harness();
-    const call = h.execute({ ...task, run_in_background });
-    const exhausted = response(); exhausted.usage.output = 4096;
-    h.pending[0].resolve(exhausted); await flush();
-    assert.equal(h.choices[1].toolChoice, "none");
-    h.pending[1].resolve(response("## Findings\nPartial report; more work needed"));
-    const result = await call; await flush();
-    const text = run_in_background ? String(h.sent[0].message.content) : result.content[0].text;
-    assert.match(text, /\[failed\]\nBudget reached.*output budget/s);
-    assert.match(text, /Partial report; more work needed/);
-    if (run_in_background) {
-      const message = { ...h.sent[0].message, role: "custom" as const, timestamp: Date.now() };
-      const rendered = h.renderers.get(RESULT_MESSAGE_TYPE)!(message, { expanded: true, outputPad: 0, keyHint: () => "", keyText: () => "" }, h.theme)!.render(200).join("\n");
-      assert.match(rendered, /Budget reached/); assert.match(rendered, /Partial report; more work needed/);
-    }
-    h.shutdown();
-  }
-});
-
-test("failed background tasks settle with other results and preserve foreground usage accounting", async () => {
-  const h = harness();
-  await h.execute({ run_in_background: true, tasks: [task, task] });
-  h.pending[0].resolve({ ...response(), stopReason: "error", errorMessage: "Unavailable" });
-  h.pending[1].resolve(response("ok")); await flush();
-  assert.equal(h.sent.length, 1);
-  assert.match(String(h.sent[0].message.content), /\[failed\]\nUnavailable/);
-  assert.match(String(h.sent[0].message.content), /\[completed\]\nok/);
-  const foreground = h.execute({ ...task, run_in_background: false });
-  h.pending[2].resolve(response());
-  assert.equal((await foreground).usage?.totalTokens, 110);
-  assert.equal(h.sent.length, 1);
-  h.shutdown();
+test("non-string budgets settings are ignored", async () => {
+  const h = harness(); h.config({ budgets: ["quick"] });
+  const call = h.agent({ run_in_background: false }); h.pending[0].resolve(response()); await call;
+  assert.equal("maxTokens" in h.choices[0], false); h.shutdown();
 });

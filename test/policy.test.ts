@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { choosePolicy, LIMITS, taskProfile } from "../src/policy.ts";
+import { choosePolicy, LIMITS, taskProfile, resolveModel, resolvePolicy } from "../src/policy.ts";
+import { builtins } from "../src/definitions.ts";
+import { harness, response, flush } from "./helpers.ts";
 import type { Task } from "../src/state.ts";
 
 const model = (id: string, provider = "test", reasoning = true) => ({ id, provider, reasoning, maxTokens: 32768 } as Model<Api>);
@@ -41,6 +43,50 @@ test("inherit and unavailable cheap tiers keep the parent, not invented model na
   assert.equal(choosePolicy(task(), gpt, [gpt, opus, sonnet]).model, gpt);
   assert.equal(choosePolicy(task({ profile: "quick" }), gpt, [gpt]).model, gpt);
 });
+test("aliases prefer parent provider, then anthropic, then others, newest numeric ID within provider", () => {
+  const old = model("claude-sonnet-4-9"), newer = model("claude-sonnet-4-10"), anth = model("claude-sonnet-5", "anthropic"), other = model("claude-sonnet-9", "other");
+  assert.equal(resolveModel("sonnet", opus, [other, anth, old, newer]), newer);
+  assert.equal(resolveModel("sonnet", opus, [other, anth]), anth);
+  assert.equal(resolveModel("sonnet", opus, [other]), other);
+  for (const alias of ["opus", "haiku", "fable"]) {
+    const candidate = model(`claude-${alias}-4`); assert.equal(resolveModel(alias, sonnet, [candidate]), candidate);
+  }
+  assert.throws(() => resolveModel("fable", opus, [opus]), /unavailable/);
+  assert.throws(() => resolveModel("missing/id", opus, [opus]), /unavailable/);
+  assert.equal(resolveModel("test/claude-opus-5-5", sonnet, [opus]), opus);
+  assert.equal(resolveModel(opus.id, sonnet, [opus]), opus);
+});
+test("model precedence and effort inheritance are independent of old routing unless opted in", () => {
+  const config = { maxConcurrent: 20, budgets: "off" as const, autoModel: false, resultFiles: false, fileLocks: true };
+  const def = builtins()[0], available = [opus, sonnet, haiku];
+  const policy = (extra: Partial<Task> = {}, definition = def, settings = config) => resolvePolicy(task(extra), definition, settings, opus, available, "xhigh");
+  assert.equal(policy().model, opus); assert.equal(policy().effort, "xhigh"); assert.equal(policy().limits, undefined);
+  assert.equal(policy({}, def, { ...config, defaultModel: "haiku" } as typeof config).model, haiku);
+  assert.equal(policy({}, { ...def, model: "sonnet" }, { ...config, defaultModel: "haiku" } as typeof config).model, sonnet);
+  assert.equal(policy({ model: "haiku" }, { ...def, model: "sonnet" }).model, haiku);
+  assert.equal(policy({}, { ...def, effort: "max" }).effort, "max"); assert.equal(policy({ effort: "low" }, { ...def, effort: "max" }).effort, "low");
+  assert.equal(policy({}, { ...def, effort: 7 }).effort, "xhigh");
+  assert.equal(policy({ subagent_type: "Explore" }, def, { ...config, autoModel: true }).model, haiku);
+  assert.equal(policy({ model: "sonnet", subagent_type: "Explore" }, def, { ...config, autoModel: true }).model, sonnet);
+});
+test("Agent inherits Pi thinking level, supports CC effort levels and rejects unresolved aliases before launch", async () => {
+  for (const effort of [undefined, "low", "medium", "high", "xhigh", "max"]) {
+    const h = harness(); h.thinking("xhigh"); await h.agent({ effort });
+    assert.equal(h.choices[0].reasoning, effort ?? "xhigh"); h.pending[0].resolve(response()); await flush(); h.shutdown();
+  }
+  const h = harness(); await assert.rejects(h.agent({ model: "fable" }), /unavailable/); assert.equal(h.pending.length, 0);
+  h.ctx.model!.reasoning = false; await h.agent({ effort: "max" }); assert.equal(h.choices[0].reasoning, undefined);
+  h.pending[0].resolve(response()); await flush(); h.shutdown();
+});
+test("settings defaultModel/autoModel select models only when enabled", async () => {
+  for (const autoModel of [false, true]) {
+    const h = harness(); h.available([h.ctx.model!, haiku]); h.config({ autoModel }); await h.agent({ subagent_type: "Explore" });
+    assert.equal(h.models[0], autoModel ? haiku : h.ctx.model); h.pending[0].resolve(response()); await flush(); h.shutdown();
+  }
+  const h = harness(); h.available([h.ctx.model!, sonnet]); h.config({ defaultModel: "test/claude-sonnet-5-5" }); await h.agent();
+  assert.equal(h.models[0], sonnet); h.pending[0].resolve(response()); await flush(); h.shutdown();
+});
+
 test("non-reasoning models disable effort and quick tasks have tighter limits", () => {
   const fixed = model("plain", "test", false);
   assert.equal(choosePolicy(task({ effort: "high" }), fixed, [fixed]).effort, "off");

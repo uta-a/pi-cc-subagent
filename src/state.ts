@@ -1,13 +1,15 @@
-import type { Usage } from "@earendil-works/pi-ai";
+import type { Usage, ThinkingLevel } from "@earendil-works/pi-ai";
+import { randomBytes } from "node:crypto";
 
 export type Profile = "quick" | "balanced" | "deep";
-export type Effort = "off" | "minimal" | "low" | "medium" | "high";
+export type Effort = "off" | ThinkingLevel;
 export type Status = "pending" | "running" | "completed" | "failed" | "aborted";
 export interface Task {
   description: string;
   prompt: string;
-  subagent_type?: "Explore" | "Plan" | "general-purpose";
-  /** Optional display name, e.g. "researcher"; does not change permissions or routing. */
+  subagent_type?: string;
+  run_in_background?: boolean;
+  /** Session address as well as display name. */
   name?: string;
   profile?: Profile | "auto";
   model?: string;
@@ -19,6 +21,8 @@ export interface Activity {
   error?: boolean;
 }
 export interface Run {
+  id: string;
+  turnLimit?: number;
   task: Task;
   status: Status;
   startedAt: number;
@@ -53,7 +57,7 @@ export function addUsage(target: Usage, usage: Usage): void {
   for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) target.cost[key] += usage.cost[key];
 }
 export function createRun(task: Task): Run {
-  return { task, status: "pending", startedAt: 0, durationMs: 0, toolUses: 0, tokens: 0, usage: emptyUsage(), activities: [], output: "" };
+  return { id: `a${randomBytes(8).toString("hex")}`, task, status: "pending", startedAt: 0, durationMs: 0, toolUses: 0, tokens: 0, usage: emptyUsage(), activities: [], output: "" };
 }
 export const MAX_NAME_LENGTH = 24;
 /** Single-line, bounded display name; undefined when absent or blank. */

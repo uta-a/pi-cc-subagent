@@ -1,5 +1,7 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { Effort, Profile, Task } from "./state.ts";
+import type { Definition } from "./definitions.ts";
+import type { Settings } from "./settings.ts";
 
 export const LIMITS = {
   quick: { turns: 6, toolUses: 12, response: 2048, output: 4096, toolBytes: 4096 },
@@ -13,6 +15,28 @@ export function taskProfile(task: Task): Profile {
   if (task.subagent_type === "Plan" || /architecture|race condition|deadlock|security audit|cryptograph|セキュリティ監査|脆弱性|デッドロック|競合状態|アーキテクチャ|設計判断/i.test(text)) return "deep";
   if (task.subagent_type === "Explore" || /\b(typo|rename|formatting)\b|誤字|軽微な修正|表記ゆれ/.test(text)) return "quick";
   return "balanced";
+}
+
+export function resolveModel(requested: string | undefined, parent: Model<Api>, available: readonly Model<Api>[]): Model<Api> {
+  if (!requested || requested === "inherit") return parent;
+  const alias = ["sonnet", "opus", "haiku", "fable"].includes(requested);
+  const candidates = available.filter(model => alias ? model.id.toLowerCase().includes(requested)
+    : requested === `${model.provider}/${model.id}` || requested === model.id);
+  const rank = (provider: string) => provider === parent.provider ? 0 : provider === "anthropic" ? 1 : 2;
+  candidates.sort((a, b) => rank(a.provider) - rank(b.provider) || a.provider.localeCompare(b.provider)
+    || b.id.localeCompare(a.id, "en", { numeric: true }));
+  if (!candidates.length || (!alias && candidates.length > 1)) throw new Error(`Model unavailable or ambiguous: ${requested}`);
+  return candidates[0];
+}
+
+export function resolvePolicy(task: Task, definition: Definition, config: Settings, parent: Model<Api>, available: readonly Model<Api>[], thinking: Effort, scoped = available) {
+  const requested = task.model ?? definition.model ?? config.defaultModel;
+  const model = !task.model && !definition.model && config.autoModel
+    ? choosePolicy({ ...task, model: undefined }, parent, scoped).model : resolveModel(requested, parent, available);
+  const effort: Effort = !model.reasoning ? "off" : task.effort && task.effort !== "auto" ? task.effort
+    : typeof definition.effort === "string" ? definition.effort as Effort : thinking;
+  const profile = config.budgets === "off" ? undefined : config.budgets === "auto" ? taskProfile(task) : config.budgets;
+  return { model, effort, profile, limits: profile ? LIMITS[profile] : undefined };
 }
 
 const fast = (model: Model<Api>) => /haiku|(?:^|[-_.])mini(?:$|[-_.])|flash/i.test(model.id);

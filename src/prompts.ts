@@ -1,4 +1,9 @@
-import type { Task } from "./state.ts";
+import fs from "node:fs";
+import os from "node:os";
+import { basename, dirname, join, relative, resolve } from "node:path";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Definition } from "./definitions.ts";
+import { AUTHORITY, NOTES } from "./cc-texts.ts";
 
 export const MAX_CONTEXT_BYTES = 32 * 1024;
 export interface ProjectContext {
@@ -23,17 +28,24 @@ export function captureContext(files: { path: string; content: string }[] | unde
   } catch { return undefined; }
 }
 
-export function roleContract(type: Task["subagent_type"]): string {
-  if (type === "Explore") return "Start from paths/symbols in the task; use find/grep narrowly before reading, and read only needed ranges. Quote at most about 5 lines of code. Report: ## Findings (bullets with path:line ranges), ## Start here, ## Gaps.";
-  if (type === "Plan") return "Stay read-only. Report: ## Recommendation, ## Steps, ## Risks, ## Open questions.";
-  return "Report: ## Changed files, ## Validation (commands run and results), ## Open risks, ## Next step. Never claim success if you did not make the required edits or validation failed. If a decision is not approved by the task, stop and report ## Needs decision with options instead of guessing.";
+export function childSystem(definition: Definition, cwd: string, model: Model<Api>): string {
+  let dir = resolve(cwd), git = false;
+  for (;;) {
+    if (fs.existsSync(join(dir, ".git"))) { git = true; break; }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  const environment = `# Environment\nYou have been invoked in the following environment: \n - Primary working directory: ${cwd}\n - Is a git repository: ${git}\n - Platform: ${process.platform}\n - Shell: ${basename(process.env.SHELL ?? "unknown")}\n - OS Version: ${os.type()} ${os.release()}\nYou are powered by the model named ${model.name ?? model.id}. The exact model ID is ${model.id}.`;
+  return [definition.prompt, AUTHORITY, NOTES, environment].join("\n\n");
 }
-
-export function usesProjectPrompt(type: Task["subagent_type"], cwd: string, context?: ProjectContext): context is ProjectContext {
-  return (type === "Explore" || type === "Plan") && !!context?.files.length && context.cwd === cwd;
-}
-
-export function promptBase(type: Task["subagent_type"], cwd: string, parent: () => string, context?: ProjectContext): string {
-  if (!usesProjectPrompt(type, cwd, context)) return parent();
-  return `You are a read-only ${type} subagent assisting a coding agent.\nWorking directory: ${cwd}\nToday's date: ${new Date().toISOString().slice(0, 10)}\n<project_context>\n${context.files.map(file => `File: ${file.path}\n${file.content}`).join("\n\n")}\n${context.truncated ? "[Project context truncated at the 32 KiB whole-file budget]\n" : ""}</project_context>`;
+const under = (path: string, dir: string) => { const rel = relative(dir, path); return !rel.startsWith("..") && !rel.startsWith("/"); };
+export function userContext(definition: Definition, cwd: string, context?: ProjectContext): string {
+  const files = !definition.omitClaudeMd && context?.cwd === cwd ? context.files : [];
+  const label = (path: string) => under(path, cwd) ? "project instructions, checked into the codebase"
+    : under(path, join(os.homedir(), ".pi")) || under(path, join(os.homedir(), ".claude"))
+      ? "user's private global instructions for all projects" : "user's private project instructions, not checked in";
+  const claudeMd = files.length ? `# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\n${files.map(file => `Contents of ${resolve(cwd, file.path)} (${label(resolve(cwd, file.path))}):\n\n${file.content}`).join("\n\n")}\n` : "";
+  const truncated = !definition.omitClaudeMd && context?.cwd === cwd && context.truncated ? "[Project context truncated at the 32 KiB whole-file budget]\n" : "";
+  return `<system-reminder>\nAs you answer the user's questions, you can use the following context:\n${claudeMd}${truncated}# currentDate\nToday's date is ${new Date().toISOString().slice(0, 10)}.\n\n      Claude Code attached this context automatically; it isn't part of the user's message. It describes the user's own account and workspace, so they don't need it reported back.\n</system-reminder>`;
 }

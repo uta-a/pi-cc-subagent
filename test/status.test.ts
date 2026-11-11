@@ -26,7 +26,7 @@ const titles = (text: string | undefined) => text?.split("\n").map(row => row.sp
 test("screenshot rows: white bold main, gray hollow children and right-hand stats", () => {
   const child = run("Explore", "running", { startedAt: 4000, tokens: 26400, activities: [{ kind: "tool", text: "Read(a)" }] });
   assert.equal(renderAgentStatus([child], tagged, undefined, 10000), "<w:b>● main</>\n<g>○ Explore  task</>\t<g>6s · ↓ 26.4k tokens</>");
-  assert.deepEqual(titles(renderAgentStatus([run("Explore"), run(), run("Plan")], plain)), ["● main", "○ Explore  task", "○ worker  task", "○ Plan  task"]);
+  assert.deepEqual(titles(renderAgentStatus([run("Explore"), run(), run("Plan")], plain)), ["● main", "○ Explore  task", "○ general-purpose  task", "○ Plan  task"]);
 });
 test("selected child is white and main becomes gray", () => {
   const child = run("Plan");
