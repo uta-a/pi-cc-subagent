@@ -12,7 +12,7 @@ import { captureContext, type ProjectContext } from "./prompts.ts";
 import { ResultFiles } from "./results.ts";
 import { Definitions, agentListing } from "./definitions.ts";
 import { settings } from "./settings.ts";
-import { resolvePolicy } from "./policy.ts";
+import { resolveModel, resolvePolicy } from "./policy.ts";
 import { AGENT_PROMPT, SEND_PROMPT, FIELD_DESCRIPTIONS as D } from "./cc-texts.ts";
 
 export const agentSchema = Type.Object({
@@ -66,8 +66,22 @@ export default function ccSubagent(pi: ExtensionAPI): void {
     clearDemo(ctx);
     navigation.attach(ctx);
     const active = new Set(pi.getActiveTools());
-    const listing = agentListing(load(ctx), pi.getAllTools().filter(tool => active.has(tool.name)));
-    return { systemPrompt: `${event.systemPrompt}\n\n<system-reminder>\n${listing}\nWhen you launch multiple agents for independent work, send them in a single message with multiple Agent calls.\n</system-reminder>` };
+    const config = settings(pi);
+    const available = ctx.modelRegistry.getAvailable();
+    // Same order as an Agent call without a model argument; rebuilt every turn, so it follows /model changes.
+    const modelOf = (def: { model?: string }) => {
+      if (!ctx.model) return "inherit (no main model selected)";
+      if (!def.model && config.autoModel) return "auto (chosen per task)";
+      const spec = def.model ?? config.defaultModel;
+      try { const model = resolveModel(spec, ctx.model, available); return `${model.provider}/${model.id}`; }
+      catch { return `unavailable (${spec})`; }
+    };
+    const listing = agentListing(load(ctx), pi.getAllTools().filter(tool => active.has(tool.name)), modelOf);
+    // A section (not a returned systemPrompt): Pi patches only changed sections, and pi-claude-bridge forwards sections but drops replaced prompts.
+    const sections = event.systemPromptOptions?.sections;
+    const text = `${listing}\nWhen you launch multiple agents for independent work, send them in a single message with multiple Agent calls.`;
+    if (sections) sections["system-reminder"] = text;
+    else return { systemPrompt: `${event.systemPrompt}\n\n<system-reminder>\n${text}\n</system-reminder>` };
   });
   const fromChild = (parent: string | undefined) => parent !== undefined && [...childCallRoots].some(root => parent === root || parent.startsWith(`${root}/`));
   pi.on("tool_call", (event, ctx) => {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { harness, response, flush } from "./helpers.ts";
+import { harness, response, flush, model } from "./helpers.ts";
 import { FIELD_DESCRIPTIONS, AGENT_PROMPT, SEND_PROMPT } from "../src/cc-texts.ts";
 import { settings } from "../src/settings.ts";
 
@@ -22,7 +22,24 @@ test("before_agent_start injects deterministic agent types and actual Pi tools e
   const explore = first.split("\n").find(line => line.startsWith("- Explore:"))!;
   assert.match(explore, /Tools: All tools except write, edit/);
   assert.match(first, /- general-purpose:.*\(Tools: All tools\)/);
-  assert.equal(h.before().systemPrompt, first); h.shutdown();
+  assert.equal(h.before().systemPrompt, first);
+  // Uses a prompt section (forwarded by pi-claude-bridge); replaces the prompt only when sections are unavailable.
+  assert.equal(h.before().replaced, false);
+  const fallback = h.before(undefined, false); assert.equal(fallback.replaced, true); assert.match(fallback.systemPrompt, /<system-reminder>\nAvailable agent types/); h.shutdown();
+});
+test("agent listing shows the provider/model each agent would run on", () => {
+  const h = harness();
+  h.available([model("claude-opus-4-6"), model("claude-haiku-5-5", "other"), model("gpt-6-luna", "openai-codex")]);
+  const line = (prompt: string, name: string) => prompt.split("\n").find(l => l.startsWith(`- ${name}:`))!;
+  assert.match(line(h.before().systemPrompt, "Explore"), /\(Tools: [^)]*\) \(Model: test\/claude-opus-4-6\)$/);
+  h.config({ defaultModel: "openai-codex/gpt-6-luna" });
+  assert.match(line(h.before().systemPrompt, "general-purpose"), /\(Model: openai-codex\/gpt-6-luna\)$/);
+  h.config({ defaultModel: "haiku" });
+  assert.match(line(h.before().systemPrompt, "Plan"), /\(Model: other\/claude-haiku-5-5\)$/);
+  h.config({ defaultModel: "missing/model" });
+  assert.match(line(h.before().systemPrompt, "Plan"), /\(Model: unavailable \(missing\/model\)\)$/);
+  h.config({ autoModel: true });
+  assert.match(line(h.before().systemPrompt, "Plan"), /\(Model: auto \(chosen per task\)\)$/); h.shutdown();
 });
 test("unknown subagent_type errors list active definitions without launching", async () => {
   const h = harness(); await assert.rejects(h.agent({ subagent_type: "unknown" }), /Available types: general-purpose, Explore, Plan/);

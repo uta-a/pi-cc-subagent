@@ -73,7 +73,12 @@ export function harness() {
   return { pi, ctx, theme, events, commands, tools, renderers, sent, writes, notices, pending, conversations, choices, models, nested, call,
     agent: (params: Record<string, unknown> = {}, signal?: AbortSignal, update?: (result: Result) => void) => call("Agent", { ...task, ...params }, signal, update),
     config: (value: unknown) => { config = value; }, thinking: (value: string) => { thinking = value; }, available: (value: Model<Api>[]) => { available = value; }, busy: () => { idle = false; },
-    before: (files?: { path: string; content: string }[]) => events.get("before_agent_start")!({ systemPrompt: "PARENT SECRET SYSTEM", systemPromptOptions: { contextFiles: files, cwd: ctx.cwd } }, ctx) as { systemPrompt: string },
+    // Renders sections the way Pi wraps them, so tests see the prompt the model gets.
+    before: (files?: { path: string; content: string }[], withSections = true) => {
+      const sections: Record<string, string> | undefined = withSections ? {} : undefined;
+      const result = events.get("before_agent_start")!({ systemPrompt: "PARENT SECRET SYSTEM", systemPromptOptions: { contextFiles: files, cwd: ctx.cwd, sections } }, ctx) as { systemPrompt: string } | undefined;
+      return { systemPrompt: result?.systemPrompt ?? ["PARENT SECRET SYSTEM", ...Object.entries(sections ?? {}).map(([name, text]) => `<${name}>\n${text}\n</${name}>`)].join("\n\n"), replaced: result !== undefined };
+    },
     shutdown: () => events.get("session_shutdown")!({}, ctx),
   };
 }

@@ -120,6 +120,8 @@ CC のコア名は `Read→read`, `Grep→grep`, `Glob→find`, `Bash→bash`, `
 
 提供元が短い子プロンプトを拒否する場合があります。初回要求が出力ゼロのエラーになった場合だけ、親のシステムプロンプトを前置して1回再試行します。`pi-claude-bridge` の `prompt-capture` 拒否を想定した互換処理です。この場合は親プロンプトを省く効果はなくなります。後続ターンのエラーや部分出力がある失敗では再試行しません。
 
+親には毎ターン、CC と同じ形式のエージェント一覧（`- 名前: 説明 (Tools: …)`）を渡します。**Pi 独自の追加として、各行の末尾に `(Model: provider/model-id)` を付けます**。値は `model` 引数を省略して呼んだ場合に使われるモデルで、親のモデルを `/model` で切り替えると次のターンから追従します。`autoModel` が有効で定義にモデル指定がない場合は `auto (chosen per task)`、解決できない指定は `unavailable (…)` と表示します。一覧はプロンプトの section（`<system-reminder>`）として追加します。システムプロンプト全体は置き換えないので、`pi-claude-bridge` 経由のメインモデルにも届きます。
+
 モデル選択は `Agent.model` > 定義の `model` > `ccSubagent.defaultModel` > 親。定義・設定では `inherit`、エイリアス、完全な `provider/id` または正確なモデル ID を指定できます。エイリアスは利用可能一覧の ID に系列名が含まれるものから、親 provider、`anthropic`、その他の順、同 provider 内は数値を考慮した ID 降順で選びます。解決不能・曖昧な正確 ID はエラーにし、黙って代替しません。
 
 effort は引数 > 定義の文字列 > `pi.getThinkingLevel()`。Pi の同名レベルへ渡し、非推論モデルは off。provider 固有の変換は Pi に任せます。再開では元のモデル・effort を維持します。

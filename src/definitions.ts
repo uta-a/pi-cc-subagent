@@ -34,13 +34,14 @@ export function childTools<T extends Tool>(tools: readonly T[], definition: Defi
       && (!allow || allow.includes("*") || allow.includes(name)) && !deny.includes(name) && !deny.includes("*");
   });
 }
-export function agentListing(definitions: readonly Definition[], tools: readonly Tool[]): string {
+/** CC's listing line, plus a Pi addition: the provider/model each agent runs on. */
+export function agentListing(definitions: readonly Definition[], tools: readonly Tool[], modelOf?: (definition: Definition) => string): string {
   return "Available agent types for the Agent tool:\n" + definitions.map(def => {
     const allowed = def.tools && !def.tools.includes("*");
     const disallowed = tools.filter(tool => def.disallowedTools?.map(mapped).includes(tool.name.toLowerCase())).map(t => t.name);
     const summary = allowed ? childTools(tools, def).map(t => t.name).join(", ") || "None"
       : disallowed.length ? `All tools except ${disallowed.join(", ")}` : "All tools";
-    return `- ${def.name}: ${def.description.replace(/\s+/g, " ")} (Tools: ${summary})`;
+    return `- ${def.name}: ${def.description.replace(/\s+/g, " ")} (Tools: ${summary})${modelOf ? ` (Model: ${modelOf(def)})` : ""}`;
   }).join("\n");
 }
 
